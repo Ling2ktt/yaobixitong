@@ -1,0 +1,111 @@
+# ==========================================
+# 旺财自动交易系统 - Docker Compose 配置
+# WangCai Auto Trading System
+# ==========================================
+
+version: '3.8'
+
+services:
+  # 主应用
+  wangcai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wangcai-trading
+    restart: unless-stopped
+    
+    environment:
+      # Binance API
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      # OKX API
+      - OKX_API_KEY=${OKX_API_KEY}
+      - OKX_API_SECRET=${OKX_API_SECRET}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE}
+      # AI API
+      - AI_API_KEY=${AI_API_KEY}
+      # Telegram
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # Webhook
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      # DB
+      - DB_PASSWORD=${DB_PASSWORD}
+    
+    volumes:
+      # 持久化数据
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      # 配置文件（可热更新）
+      - ./config:/app/config:ro
+      - ./.env:/app/.env:ro
+    
+    ports:
+      # 健康检查端口
+      - "8080:8080"
+      # Prometheus 指标端口
+      - "9090:9090"
+    
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    
+    # 网络
+    networks:
+      - wangcai-network
+    
+    # 时区
+    environment:
+      - TZ=Asia/Shanghai
+
+  # 可选: Redis 缓存（用于高阶功能）
+  redis:
+    image: redis:7-alpine
+    container_name: wangcai-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - wangcai-network
+    profiles:
+      - advanced
+
+  # 可选: PostgreSQL 数据库（用于生产环境）
+  postgres:
+    image: postgres:15-alpine
+    container_name: wangcai-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=wangcai
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-wangcai123}
+      - POSTGRES_DB=wangcai
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - wangcai-network
+    profiles:
+      - advanced
+
+# 网络
+networks:
+  wangcai-network:
+    driver: bridge
+
+# 卷
+volumes:
+  redis-data:
+  postgres-data:

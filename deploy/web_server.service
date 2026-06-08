@@ -1,0 +1,17 @@
+[Unit]
+Description=旺财 Web 前端
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wangcai
+Environment="PATH=/opt/wangcai/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/wangcai/venv/bin/python3 /opt/wangcai/web_server.py
+Restart=always
+RestartSec=10
+StandardOutput=file:/opt/wangcai/logs/web.log
+StandardError=file:/opt/wangcai/logs/web_err.log
+
+[Install]
+WantedBy=multi-user.target

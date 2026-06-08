@@ -1,0 +1,290 @@
+ai:
+  api_key: ${AI_API_KEY}
+  base_url: https://api.deepseek.com/v1
+  max_tokens: 16384
+  model: deepseek-v4-flash
+  provider: deepseek
+  strategy_style: balanced
+  temperature: 0.3
+  system_prompt_file: config/ai_system_prompt.txt
+ai_external:
+  analysis_file: data/ai_analysis.json
+  decision_file: data/ai_decision.json
+  decision_ttl: 7200
+  refresh_interval: 300
+database:
+  sqlite_path: data/wangcai.db
+  type: sqlite
+exchanges:
+  binance:
+    api_key: ${BINANCE_API_KEY}
+    api_secret: ${BINANCE_API_SECRET}
+    enabled: true
+    preferred_markets:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+    - BNB/USDT
+    - XRP/USDT
+    - AAPL/USDT
+    - TSLA/USDT
+    - GOOGL/USDT
+    - AMZN/USDT
+    - MSFT/USDT
+    - NVDA/USDT
+    - META/USDT
+    - MSTR/USDT
+    - COIN/USDT
+    - AMD/USDT
+    - PLTR/USDT
+    - HOOD/USDT
+    - UBER/USDT
+    - ONDO/USDT
+    - DOGE/USDT
+    - ADA/USDT
+    - AVAX/USDT
+    - LINK/USDT
+    - DOT/USDT
+    - SUI/USDT
+    - APT/USDT
+    - ARB/USDT
+    - OP/USDT
+    - NEAR/USDT
+    - AAVE/USDT
+    - UNI/USDT
+    - CRV/USDT
+    - PEPE/USDT
+    - WIF/USDT
+    - FET/USDT
+    - TAO/USDT
+    - WLD/USDT
+    - FIL/USDT
+    - MU/USDT
+    - SAGA/USDT
+    - RENDER/USDT
+    - INJ/USDT
+    - TIA/USDT
+    - DYDX/USDT
+    - PENDLE/USDT
+    - DOGS/USDT
+    - DYM/USDT
+    - PHA/USDT
+    - DRIFT/USDT
+    - DEXE/USDT
+    - RIF/USDT
+    sandbox: false
+  okx:
+    api_key: ${OKX_API_KEY}
+    api_secret: ${OKX_API_SECRET}
+    enabled: false
+    passphrase: ${OKX_PASSPHRASE}
+    preferred_markets:
+    - BTC/USDT
+    sandbox: true
+info:
+  cryptopanic_api_key: ${CRYPTOPANIC_API_KEY}
+  keywords:
+  - Bitcoin
+  - BTC
+  - Ethereum
+  - ETH
+  - crypto
+  - federal reserve
+  - ETF
+  - SEC
+  - Binance
+  max_items_per_source: 5
+  sentiment_threshold: 0.1
+  sources:
+  - funding
+  - fear_greed
+  whale_alert_api_key: ${WHALE_ALERT_API_KEY}
+notifications:
+  telegram:
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    enabled: false
+  webhook:
+    enabled: false
+    url: ${WEBHOOK_URL}
+order:
+  mode: futures
+proxy: http://127.0.0.1:7897
+redis:
+  db: 0
+  enabled: false
+  host: localhost
+  port: 6379
+risk:
+  circuit_breaker:
+    consecutive_losses: 3
+    cooldown_minutes: 30
+    daily_loss_pct: 0.05
+    enabled: true
+  leverage_default: 1
+  max_daily_loss_pct: 0.2
+  max_daily_loss_usdt: 20
+  max_position_value_usdt: 100
+  max_positions: 5
+  max_single_order_pct: 0.3
+  max_single_order_usdt: 10
+  stop_loss_pct: 0.02
+system:
+  decision_mode: yanchi
+  log_level: INFO
+  main_loop:
+    account_sync_interval: 30
+    interval_seconds: 900
+    market_data_interval: 10
+  mode: live
+  monitoring:
+    enabled: true
+    health_check_port: 8080
+    metrics_port: 9090
+  name: 旺财
+  timezone: Asia/Shanghai
+  version: 2.0.0
+trinity:
+  advanced:
+    cache_enabled: true
+    cache_ttl: 300
+    skip_ai_review: true
+    data_source: binance
+    enable_backtest: false
+    enable_optimization: false
+    enable_visualization: true
+  entry_tf: 15m
+  require_15m_pa_confirmation: false
+  pa:
+    engulfing_ratio: 1.5
+    pin_bar_ratio: 2.0
+    structure_lookback: 50
+  risk:
+    leverage: 1.0
+    max_risk_per_trade: 0.02
+    stop_loss_buffer: 0.005
+  scoring:
+    higher_tf_align_weight: 2
+    liquidity_hunt_weight: 3
+    min_score_to_trade: 7
+    ob_fvg_support_weight: 1
+    pa_pattern_weight: 2
+    smc_structure_weight: 2
+    wyckoff_phase_weight: 3
+  signal_tf: 1h
+  smc:
+    displacement_mult: 1.5
+    fvg_lookback: 200
+    liquidity_buffer: 0.005
+    ob_lookback: 200
+  symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  - XRP/USDT
+  - AAPL/USDT
+  - TSLA/USDT
+  - GOOGL/USDT
+  - AMZN/USDT
+  - MSFT/USDT
+  - NVDA/USDT
+  - META/USDT
+  - MSTR/USDT
+  - COIN/USDT
+  - AMD/USDT
+  - PLTR/USDT
+  - HOOD/USDT
+  - UBER/USDT
+  - ONDO/USDT
+  - DOGE/USDT
+  - ADA/USDT
+  - AVAX/USDT
+  - LINK/USDT
+  - DOT/USDT
+  - SUI/USDT
+  - APT/USDT
+  - ARB/USDT
+  - OP/USDT
+  - NEAR/USDT
+  - AAVE/USDT
+  - UNI/USDT
+  - CRV/USDT
+  - PEPE/USDT
+  - WIF/USDT
+  - FET/USDT
+  - TAO/USDT
+  - WLD/USDT
+  - FIL/USDT
+  - MU/USDT
+  - SAGA/USDT
+  - RENDER/USDT
+  - INJ/USDT
+  - TIA/USDT
+  - DYDX/USDT
+  - PENDLE/USDT
+  - DOGS/USDT
+  - DYM/USDT
+  - PHA/USDT
+  - DRIFT/USDT
+  - DEXE/USDT
+  - RIF/USDT
+  take_profit:
+    min_rr_ratio: 2.0
+    tp1_rr_ratio: 2.0
+    tp2_rr_ratio: 3.0
+    tp3_rr_ratio: 4.0
+    tier1_pct: 0.5
+    tier2_pct: 0.3
+    tier3_pct: 0.2
+    trailing_enabled: true
+  trend_tf: 4h
+  wyckoff:
+    range_min_bars: 20
+    spring_wick_ratio: 0.6
+    ut_wick_ratio: 0.6
+    volume_spike_mult: 2.0
+yanchi:
+  atr_len: 14
+  ema_fast: 20
+  ema_slow: 50
+  entry_tf: 1h
+  fixed_position_usdt: 10.0
+  higher_tf: 4h
+  leverage: 1.0
+  min_confluence_score: 4.5
+  min_rr_ratio: 2.0
+  retest_atr_buffer: 0.25
+  structure_lookback: 40
+  volume_lookback: 20
+wyckoff_smc:
+  btc_dominance_max: 50
+  fear_greed_max: 70
+  fear_greed_min: 30
+  fvg_lookback: 200
+  leverage: 1.0
+  max_market_cap: 5e9
+  max_momentum_7d: 50
+  max_risk_per_trade: 0.02
+  min_market_cap: 5e7
+  min_momentum_7d: 10
+  min_volume: 1e7
+  ob_lookback: 200
+  stop_loss_buffer: 0.005
+  take_profit_multiple: 2.0
+screener:
+  enabled: true
+  min_volume_usdt: 10000
+  min_price: 0.0001
+  min_atr_pct: 0.5
+  max_atr_pct: 40.0
+  min_klines: 20
+  max_tokens: 55
+trinity_llm:
+  enabled: false
+  provider: deepseek
+  model: deepseek-v4-flash
+  temperature: 0.3
+  timeout: 30
+  fallback_approve: false
+  total_market_cap_min: 2.5e12

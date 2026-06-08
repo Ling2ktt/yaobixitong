@@ -1,0 +1,57 @@
+# ============================================================
+# 妖币交易系统 - 三位一体策略配置
+# ============================================================
+# 使用方式: 在 config/system.yaml 中设置 decision_mode: "trinity"
+#=============================================================
+
+# --- 代码层参数 ---
+# 每笔交易风险比例 (账户的百分比)
+risk_per_trade: 0.02
+
+# 合约杠杆
+leverage: 5
+
+# 最大同时持仓数
+max_positions: 2
+
+# 每日最大亏损 (账户的百分比)
+max_daily_loss: 0.06
+
+# 是否检查资金费率 (做多时资金费率过高会警告)
+check_funding_rate: true
+
+# 做多最低评分 (低于此值的做多信号不出手)
+min_score_long: 70
+
+# 做空最低评分 (低于此值的做空信号不出手)
+min_score_short: 70
+
+# --- LLM 审核层参数 (可选) ---
+llm:
+  # 是否启用 LLM 二次审核
+  # true:  代码层分析后送入LLM审核
+  # false: 纯代码层判断，B级以上直接执行
+  enabled: false
+
+  # LLM 提供商 (openai / deepseek / 兼容 OpenAI API 的任何服务)
+  provider: openai
+
+  # API Key (为空时使用 config/system.yaml 中 ai 的 api_key)
+  api_key: ""
+
+  # API 地址
+  api_base: "https://api.openai.com/v1"
+
+  # 模型名称
+  model: gpt-4
+
+  # 温度 (0-1, 越低越确定性, 交易场景推荐0.2-0.3)
+  temperature: 0.3
+
+  # 超时(秒)
+  timeout: 30
+
+  # LLM不可用时是否自动批准代码层信号
+  # true:  信任代码层，自动通过 (风险较高)
+  # false: 保守拒绝，保护资金安全 (推荐)
+  fallback_approve: false

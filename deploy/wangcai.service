@@ -1,0 +1,17 @@
+[Unit]
+Description=旺财自动交易系统
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wangcai
+Environment="PATH=/opt/wangcai/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/wangcai/venv/bin/python3 /opt/wangcai/main.py --mode paper
+Restart=always
+RestartSec=30
+StandardOutput=file:/opt/wangcai/logs/wangcai.log
+StandardError=file:/opt/wangcai/logs/wangcai_err.log
+
+[Install]
+WantedBy=multi-user.target
