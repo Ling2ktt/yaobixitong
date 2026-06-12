@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """旺财 BTC QuantTrend 策略 - Web 仪表盘"""
-import json, os, sys, time, subprocess, threading
+import json, os, re, sys, time, subprocess, threading
 from pathlib import Path
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request, abort
@@ -62,13 +62,12 @@ def is_running():
         project_main = (str(ROOT / "main.py")).lower().replace('\\', '/')
         project_dir = (str(ROOT)).lower().replace('\\', '/')
         import psutil
-        for p in psutil.process_iter(["pid","cmdline","cwd"]):
+        for p in psutil.process_iter(["pid","cmdline"]):
             try:
                 info = p.info
                 if info["cmdline"]:
                     cmd = " ".join(info["cmdline"]).lower().replace('\\', '/')
-                    cwd = (info.get("cwd") or "").lower().replace('\\', '/')
-                    if "main.py" in cmd and (project_main in cmd or project_dir in cwd):
+                    if "main.py" in cmd and (project_main in cmd or project_dir in cmd):
                         return True
             except: pass
     except: pass
@@ -128,6 +127,358 @@ def load_config():
             cfg = yaml.safe_load(f)
             return cfg if cfg else {}
     return {}
+
+
+def _symbol_key(value):
+    return re.sub(r'[^A-Z0-9]', '', str(value or '').upper())
+
+
+def _parse_dt(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip().replace('Z', '+00:00')
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        pass
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _coerce_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_json(value, default=None):
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+def _infer_strategy(reason, fallback=""):
+    text = str(reason or "")
+    if text.startswith("[YanChi]"):
+        return "yanchi"
+    if text.startswith("[Trinity]"):
+        return "trinity"
+    if text.startswith("[AI]"):
+        return "ai"
+    return fallback or ""
+
+
+def _fetch_rows(conn, table, limit=None):
+    sql = f"SELECT * FROM {table}"
+    if limit:
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        rows = conn.execute(sql, (limit,)).fetchall()
+    else:
+        sql += " ORDER BY timestamp DESC, id DESC"
+        rows = conn.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _pick_related_record(records, symbol, trade_time, symbol_field="symbol", decision_prefix=False):
+    key = _symbol_key(symbol)
+    best = None
+    best_score = None
+    for record in records:
+        raw_value = record.get(symbol_field, "")
+        if decision_prefix:
+            raw_value = str(raw_value).split("_", 1)[0]
+        if _symbol_key(raw_value) != key:
+            continue
+        record_time = _parse_dt(record.get("timestamp") or record.get("created_at"))
+        if trade_time and record_time:
+            score = abs((trade_time - record_time).total_seconds())
+        else:
+            score = 0
+        if best is None or score < best_score:
+            best = record
+            best_score = score
+    return best
+
+
+def _build_journal_row(trade, decision=None, risk=None):
+    trade = trade or {}
+    decision = decision or {}
+    risk = risk or {}
+    trade_time = _parse_dt(trade.get("timestamp") or trade.get("created_at"))
+    symbol = trade.get("symbol", "")
+    reason = decision.get("reason") or trade.get("reason") or ""
+    strategy = decision.get("strategy") or _infer_strategy(reason, trade.get("strategy", ""))
+    action = str(trade.get("action") or decision.get("action") or "").upper()
+    side = str(trade.get("side") or "").lower()
+    direction = "LONG" if action in ("BUY", "LONG") or side == "buy" else "SHORT" if action in ("SELL", "SHORT") or side == "sell" else action or "--"
+
+    entry_price = _coerce_float(
+        decision.get("price") if decision.get("price") is not None else trade.get("price"),
+        _coerce_float(trade.get("average_price"), 0.0),
+    )
+    stop_loss = decision.get("stop_loss")
+    if stop_loss in ("", None):
+        stop_loss = None
+    else:
+        stop_loss = _coerce_float(stop_loss, 0.0)
+
+    take_profit_levels = _safe_json(decision.get("take_profit"), [])
+    if isinstance(take_profit_levels, (int, float)):
+        take_profit_levels = [float(take_profit_levels)]
+    elif isinstance(take_profit_levels, str):
+        try:
+            parsed = json.loads(take_profit_levels)
+            take_profit_levels = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            take_profit_levels = [take_profit_levels] if take_profit_levels else []
+    elif take_profit_levels is None:
+        take_profit_levels = []
+
+    amount = _coerce_float(trade.get("filled_amount"), _coerce_float(trade.get("amount"), 0.0))
+    fees = _coerce_float(trade.get("fee"), 0.0)
+    gross_pnl = _coerce_float(trade.get("pnl"), 0.0)
+    funding_fee = _coerce_float(trade.get("funding_fee"), 0.0)
+    net_pnl = gross_pnl - fees - funding_fee
+
+    risk_amount = 0.0
+    risk_pct = 0.0
+    rr_ratio = None
+    if entry_price and stop_loss not in (None, 0) and amount:
+        risk_amount = abs(entry_price - stop_loss) * amount
+        risk_pct = abs(entry_price - stop_loss) / entry_price if entry_price else 0.0
+        if take_profit_levels:
+            rr_ratio = abs(_coerce_float(take_profit_levels[0], 0.0) - entry_price) / abs(entry_price - stop_loss) if abs(entry_price - stop_loss) > 0 else None
+
+    risk_checks = _safe_json(risk.get("checks_detail") or risk.get("checks"), [])
+    if isinstance(risk_checks, str):
+        risk_checks = [{"raw": risk_checks}]
+
+    risk_level = risk.get("overall_level") or risk.get("level") or ""
+    risk_passed = bool(risk.get("is_passed", risk_level == "PASS"))
+    trade_id = trade.get("order_id") or f"trade-{trade.get('id', '')}"
+    decision_id = decision.get("decision_id") or risk.get("decision_id") or trade_id
+
+    return {
+        "trade_id": trade_id,
+        "order_id": trade.get("order_id", ""),
+        "decision_id": decision_id,
+        "symbol": symbol,
+        "direction": direction,
+        "status": trade.get("status", ""),
+        "strategy": strategy,
+        "entry_time": trade.get("timestamp") or trade.get("created_at") or decision.get("timestamp") or "",
+        "entry_price": entry_price if entry_price is not None else None,
+        "stop_loss": stop_loss,
+        "take_profit_levels": take_profit_levels,
+        "initial_risk_usdt": risk_amount,
+        "initial_risk_pct": risk_pct,
+        "fees": fees,
+        "funding_fee": funding_fee,
+        "gross_pnl": gross_pnl,
+        "net_pnl": net_pnl,
+        "r_multiple": (net_pnl / risk_amount) if risk_amount else 0.0,
+        "signal_reason": reason,
+        "setup_reason": reason,
+        "risk_passed": risk_passed,
+        "risk_level": risk_level,
+        "risk_checks": risk_checks,
+        "trend_4h": decision.get("trend_4h", ""),
+        "raw_trade": trade,
+        "raw_decision": decision,
+        "raw_risk": risk,
+        "rr_ratio": rr_ratio,
+    }
+
+
+def _build_trade_journal_rows(conn, limit):
+    trade_rows = _fetch_rows(conn, "trades", max(limit * 4, 50))
+    if not trade_rows:
+        return []
+
+    has_decisions = False
+    has_risks = False
+    try:
+        decision_rows = _fetch_rows(conn, "decisions", max(limit * 8, 100))
+        has_decisions = True
+    except Exception:
+        decision_rows = []
+    try:
+        risk_rows = _fetch_rows(conn, "risk_checks", max(limit * 8, 100))
+        has_risks = True
+    except Exception:
+        risk_rows = []
+
+    rows = []
+    for trade in trade_rows:
+        trade_time = _parse_dt(trade.get("timestamp") or trade.get("created_at"))
+        decision = _pick_related_record(decision_rows, trade.get("symbol", ""), trade_time, symbol_field="symbol") if has_decisions else {}
+        risk = _pick_related_record(risk_rows, trade.get("symbol", ""), trade_time, symbol_field="decision_id", decision_prefix=True) if has_risks else {}
+        rows.append(_build_journal_row(trade, decision, risk))
+
+    rows.sort(key=lambda r: (_parse_dt(r.get("entry_time")) or datetime.min), reverse=True)
+    return rows[:limit]
+
+
+def _normalize_trade_journal_row(row):
+    row = dict(row or {})
+    for key in ("take_profit_levels", "risk_checks"):
+        parsed = _safe_json(row.get(key), [])
+        if parsed is None:
+            parsed = []
+        if key == "take_profit_levels" and isinstance(parsed, (int, float)):
+            parsed = [float(parsed)]
+        row[key] = parsed
+    for key in ("raw_trade", "raw_decision", "raw_risk"):
+        row[key] = _safe_json(row.get(key), {}) or {}
+    row["risk_passed"] = bool(row.get("risk_passed"))
+    row["fees"] = _coerce_float(row.get("fees"), 0.0)
+    row["funding_fee"] = _coerce_float(row.get("funding_fee"), 0.0)
+    row["gross_pnl"] = _coerce_float(row.get("gross_pnl"), 0.0)
+    row["net_pnl"] = _coerce_float(row.get("net_pnl"), 0.0)
+    row["r_multiple"] = _coerce_float(row.get("r_multiple"), 0.0)
+    if "rr_ratio" not in row:
+        entry = _coerce_float(row.get("entry_price"), 0.0)
+        stop = _coerce_float(row.get("stop_loss"), 0.0)
+        tps = row.get("take_profit_levels") or []
+        row["rr_ratio"] = (
+            abs(_coerce_float(tps[0], 0.0) - entry) / abs(entry - stop)
+            if entry and stop and tps and abs(entry - stop) > 0
+            else None
+        )
+    return row
+
+
+def _load_trade_journal_rows(conn, limit=20):
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    except Exception:
+        tables = set()
+
+    if "trade_journal" in tables:
+        try:
+            rows = conn.execute(
+                "SELECT * FROM trade_journal ORDER BY entry_time DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            if rows:
+                return [_normalize_trade_journal_row(row) for row in rows]
+        except Exception:
+            pass
+
+    return _build_trade_journal_rows(conn, limit)
+
+
+ACCOUNT_SNAPSHOT_CACHE_SECONDS = 1200
+
+
+def _table_exists(conn, table):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _normalize_position(pos, exchange="", timestamp=""):
+    raw = pos or {}
+    symbol = raw.get("symbol", "")
+    amount = _coerce_float(raw.get("amount", raw.get("contracts", raw.get("positionAmt", 0))), 0.0)
+    side = str(raw.get("side", "") or "").lower()
+    if not side and amount:
+        side = "long" if amount > 0 else "short"
+    return {
+        "timestamp": raw.get("timestamp") or timestamp,
+        "exchange": raw.get("exchange") or exchange,
+        "symbol": symbol,
+        "side": side,
+        "amount": abs(amount),
+        "entry_price": _coerce_float(raw.get("entry_price", raw.get("entryPrice", 0)), 0.0),
+        "mark_price": _coerce_float(raw.get("mark_price", raw.get("markPrice", 0)), 0.0),
+        "unrealized_pnl": _coerce_float(raw.get("unrealized_pnl", raw.get("unrealizedPnl", raw.get("unrealizedProfit", 0))), 0.0),
+        "realized_pnl": _coerce_float(raw.get("realized_pnl", raw.get("realizedPnl", 0)), 0.0),
+        "leverage": _coerce_float(raw.get("leverage", 1), 1.0),
+        "status": raw.get("status") or "open",
+    }
+
+
+def _is_empty_failed_account_snapshot(row):
+    if not row:
+        return False
+    raw = _safe_json(row.get("raw_data"), {}) or {}
+    raw_positions = raw.get("positions", []) if isinstance(raw, dict) else []
+    return (
+        _coerce_float(row.get("total_equity"), 0.0) <= 0
+        and _coerce_float(row.get("available_usdt"), 0.0) <= 0
+        and int(row.get("position_count") or 0) == 0
+        and not raw_positions
+    )
+
+
+def _latest_account_snapshot(max_age_seconds=None):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM account_snapshots ORDER BY timestamp DESC, id DESC LIMIT 50"
+        ).fetchall()
+        for row in rows:
+            data = dict(row)
+            if _is_empty_failed_account_snapshot(data):
+                continue
+            if max_age_seconds is None:
+                return data
+            ts = _parse_dt(data.get("timestamp") or data.get("created_at"))
+            if ts and (datetime.now(ts.tzinfo) - ts).total_seconds() <= max_age_seconds:
+                return data
+        return None
+    finally:
+        conn.close()
+
+
+def _account_payload_from_snapshot(row, source="snapshot_cache"):
+    if not row:
+        return None
+    raw = _safe_json(row.get("raw_data"), {}) or {}
+    positions = [
+        _normalize_position(pos, row.get("exchange", ""), row.get("timestamp", ""))
+        for pos in raw.get("positions", [])
+    ] if isinstance(raw, dict) else []
+    return {
+        "total_equity": _coerce_float(row.get("total_equity"), _coerce_float(raw.get("total_equity_usdt", 0) if isinstance(raw, dict) else 0, 0.0)),
+        "available_usdt": _coerce_float(row.get("available_usdt"), _coerce_float(raw.get("available_usdt", 0) if isinstance(raw, dict) else 0, 0.0)),
+        "position_count": int(row.get("position_count") or len(positions)),
+        "positions": positions,
+        "timestamp": row.get("timestamp") or row.get("created_at") or datetime.now().isoformat(),
+        "source": source,
+    }
+
+
+def _positions_from_latest_snapshot():
+    row = _latest_account_snapshot()
+    payload = _account_payload_from_snapshot(row, source="snapshot_cache")
+    return payload.get("positions", []) if payload else []
 
 # ═══════════════════════ HTML ═══════════════════════
 HTML = """<!DOCTYPE html>
@@ -503,7 +854,7 @@ async function loadAccount(){
     document.getElementById('posCount').textContent=pc;
     if(d.positions&&d.positions.length>0){
       posDiv.innerHTML=d.positions.map(function(p){
-        var side=p.side===('SHORT'||'short')?'short':'long';
+        var side=String(p.side||'').toLowerCase()==='short'?'short':'long';
         var pnl=parseFloat(p.unrealized_pnl||0);
         var ep=parseFloat(p.entry_price||0);
         var mp=parseFloat(p.mark_price||0)||parseFloat(p.entry_price||0);
@@ -607,6 +958,21 @@ def api_account():
 @app.route("/api/account_realtime")
 def api_account_realtime():
     """实时账户信息 - 直接从交易所API获取（合约账户）"""
+    fresh = str(request.args.get("fresh", "")).lower() in ("1", "true", "yes")
+    if not fresh:
+        cached = _account_payload_from_snapshot(
+            _latest_account_snapshot(max_age_seconds=ACCOUNT_SNAPSHOT_CACHE_SECONDS),
+            source="snapshot_cache",
+        )
+        if cached:
+            return jsonify(cached)
+        stale = _account_payload_from_snapshot(
+            _latest_account_snapshot(),
+            source="snapshot_stale",
+        )
+        if stale:
+            return jsonify(stale)
+
     try:
         import requests
         import time
@@ -634,6 +1000,7 @@ def api_account_realtime():
                 'apiKey': api_key,
                 'secret': api_secret,
                 'enableRateLimit': True,
+                'timeout': 8000,
                 'options': {
                     'defaultType': 'future',
                     'adjustForTimeDifference': True,
@@ -707,7 +1074,7 @@ def api_account_realtime():
                 cfg_ts = cfg_loader_ts(str(ROOT / "config" / "system.yaml"))
                 proxy_url_ts = cfg_ts.get('proxy') or None
                 proxies_ts = {'http': proxy_url_ts, 'https': proxy_url_ts} if proxy_url_ts else None
-                server_time_resp = req_ts.get('https://fapi.binance.com/fapi/v1/time', proxies=proxies_ts, timeout=10)
+                server_time_resp = req_ts.get('https://fapi.binance.com/fapi/v1/time', proxies=proxies_ts, timeout=5)
                 server_time_data = server_time_resp.json()
                 server_time_ms = int(server_time_data['serverTime'])
                 local_time_ms = int(time.time() * 1000)
@@ -739,7 +1106,7 @@ def api_account_realtime():
             if proxy_url:
                 proxies = {'http': proxy_url, 'https': proxy_url}
             
-            response = requests.get(url, headers=headers, proxies=proxies, timeout=30)
+            response = requests.get(url, headers=headers, proxies=proxies, timeout=8)
             if response.status_code != 200:
                 raise Exception(f"API返回错误: {response.status_code} - {response.text}")
             
@@ -776,14 +1143,30 @@ def api_account_realtime():
         
     except Exception as e:
         logger.error(f"实时账户信息获取失败: {e}")
+        cached = _account_payload_from_snapshot(_latest_account_snapshot(), source="snapshot_fallback")
+        if cached:
+            cached["error"] = str(e)
+            return jsonify(cached)
         return jsonify({"error": str(e), "total_equity": 0, "position_count": 0, "positions": []})
 
 @app.route("/api/positions")
 def api_positions():
+    conn = None
     try:
-        conn=get_db();rows=conn.execute("SELECT * FROM positions WHERE status='open' ORDER BY timestamp DESC").fetchall();conn.close()
-        return jsonify([dict(r) for r in rows])
-    except: return jsonify([])
+        conn = get_db()
+        rows = []
+        if _table_exists(conn, "positions"):
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE status='open' ORDER BY timestamp DESC, id DESC"
+            ).fetchall()
+        positions = [dict(r) for r in rows]
+        return jsonify(positions if positions else _positions_from_latest_snapshot())
+    except Exception as e:
+        logger.warning("[Web] positions 查询失败，返回账户快照持仓: {}", e)
+        return jsonify(_positions_from_latest_snapshot())
+    finally:
+        if conn:
+            conn.close()
 
 @app.route("/api/logs")
 def api_logs():
@@ -873,6 +1256,46 @@ def api_trades():
         return jsonify({'trades': trades})
     except Exception as e:
         return jsonify({'trades': [], 'error': str(e)})
+
+@app.route("/api/trade_journal")
+def api_trade_journal():
+    """获取交易复盘记录"""
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 200))
+        conn = get_db()
+        rows = _load_trade_journal_rows(conn, limit=limit)
+        conn.close()
+
+        total_fees = sum(_coerce_float(r.get("fees"), 0.0) for r in rows)
+        total_funding = sum(_coerce_float(r.get("funding_fee"), 0.0) for r in rows)
+        total_gross = sum(_coerce_float(r.get("gross_pnl"), 0.0) for r in rows)
+        total_net = sum(_coerce_float(r.get("net_pnl"), 0.0) for r in rows)
+        fee_sync = {
+            "synced": bool(rows),
+            "updated": len(rows),
+            "income_rows": sum(1 for r in rows if _coerce_float(r.get("net_pnl"), 0.0) > 0),
+        }
+        if not rows:
+            fee_sync["reason"] = "暂无复盘记录"
+
+        return jsonify({
+            "trades": rows,
+            "fee_sync": fee_sync,
+            "summary": {
+                "count": len(rows),
+                "fees": total_fees,
+                "funding_fee": total_funding,
+                "gross_pnl": total_gross,
+                "net_pnl": total_net,
+            },
+        })
+    except Exception as e:
+        logger.error("[Web] trade_journal 加载失败: {}", e)
+        return jsonify({
+            "trades": [],
+            "fee_sync": {"synced": False, "reason": str(e)},
+            "error": str(e),
+        })
 
 @app.route("/api/alerts")
 def api_alerts():

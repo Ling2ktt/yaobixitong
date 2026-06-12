@@ -88,6 +88,8 @@ class PortfolioSnapshot:
     """组合快照 - 双交易所聚合"""
     timestamp: datetime
     accounts: Dict[str, AccountSummary] = field(default_factory=dict)
+    sync_errors: Dict[str, str] = field(default_factory=dict)
+    stale: bool = False
     
     @property
     def total_equity(self) -> float:
@@ -241,11 +243,18 @@ class AccountManagerModule:
             try:
                 positions = exchange.fetch_positions()
                 for pos in positions:
-                    contracts = pos.get('contracts', 0) or pos.get('amount', 0)
+                    raw_amount = pos.get('contracts', 0) or pos.get('amount', 0)
+                    info = pos.get('info') or {}
+                    if info.get('positionAmt') not in (None, ''):
+                        raw_amount = info.get('positionAmt')
+                    contracts = float(raw_amount or 0)
                     if abs(contracts) > 0:
+                        side = str(pos.get('side') or '').lower()
+                        if side not in ('long', 'short'):
+                            side = 'long' if contracts > 0 else 'short'
                         summary.positions.append(Position(
                             symbol=pos.get('symbol', ''),
-                            side='long' if contracts > 0 else 'short',
+                            side=side,
                             amount=abs(contracts),
                             entry_price=pos.get('entryPrice', 0) or pos.get('average', 0),
                             mark_price=pos.get('markPrice', 0) or pos.get('lastPrice', 0),
@@ -263,6 +272,7 @@ class AccountManagerModule:
             
         except Exception as e:
             logger.error("[AccountManager] {} 账户同步失败: {}", exchange_name, e)
+            raise
         
         return summary
     
@@ -279,9 +289,22 @@ class AccountManagerModule:
         for name, result in zip(self.exchanges.keys(), results):
             if isinstance(result, AccountSummary):
                 snapshot.accounts[name] = result
+            elif result is not None:
+                logger.error("[AccountManager] {} 同步异常: {}", name, result)
+                snapshot.sync_errors[name] = str(result)
             else:
                 logger.error("[AccountManager] {} 同步异常: {}", name, result)
         
+        if not snapshot.accounts and self._last_snapshot is not None:
+            self._last_snapshot.stale = True
+            self._last_snapshot.sync_errors = snapshot.sync_errors
+            logger.warning(
+                "[AccountManager] 所有账户同步失败，保留上次有效快照 | 权益: ${:.2f} | 持仓: {}",
+                self._last_snapshot.total_equity,
+                self._last_snapshot.total_positions,
+            )
+            return self._last_snapshot
+
         self._last_snapshot = snapshot
         self._history.append(snapshot)
         

@@ -209,12 +209,15 @@ class WangCaiEngine:
             yanchi_config.get('symbols', ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'])
         )
 
+        original_total = len(symbols)
+        self._last_screener_result = None
         valid_symbols = []
         for sym in symbols:
             base = sym.split('/')[0] if '/' in sym else sym.replace('USDT', '')
             if len(base) >= 2:
                 valid_symbols.append(sym)
         symbols = valid_symbols
+        original_total = len(symbols)
 
         if self.screening_enabled and len(symbols) > 5:
             try:
@@ -273,40 +276,13 @@ class WangCaiEngine:
         candidates = [r for r in results if r is not None]
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        status = {
-            "status": "signals" if candidates else "no_candidates",
-            "cycle": self.cycle_count,
-            "timestamp": datetime.now().isoformat(),
-            "screening": {
-                "total": len(symbols),
-                "passed": len(candidates),
-                "top_tokens": [
-                    {
-                        "symbol": c["symbol"],
-                        "score": round(c["score"], 1),
-                        "price": c["price"],
-                        "trend": c["action"],
-                    }
-                    for c in candidates[:10]
-                ],
-            },
-            "analysis": {
-                "analyzed": len(analysis_details),
-                "errors": error_count,
-                "details": analysis_details[:20],
-            },
-            "signals": [
-                {
-                    "symbol": c["symbol"],
-                    "action": c["action"],
-                    "score": c["score"],
-                    "confidence": c["confidence"],
-                    "price": c["price"],
-                    "reason": c["reason"],
-                }
-                for c in candidates
-            ],
-        }
+        status = self._build_yanchi_status(
+            candidates=candidates,
+            analysis_details=analysis_details,
+            original_total=original_total,
+            analyzed_total=len(symbols),
+            error_count=error_count,
+        )
         self._write_strategy_status_json(status)
 
         if not candidates:
@@ -324,6 +300,12 @@ class WangCaiEngine:
         }
 
         for decision_payload in candidates:
+            can_open, live_count, max_positions = self._can_open_new_position(portfolio)
+            if not can_open:
+                logger.warning("[YanChi] 当前实时持仓已达上限({}/{})，停止开仓",
+                               live_count, max_positions)
+                break
+
             if portfolio.total_positions >= self.risk_control.position_sizing.max_positions:
                 logger.warning("[YanChi] 已达最大持仓数({})，停止开仓", self.risk_control.position_sizing.max_positions)
                 break
@@ -470,6 +452,12 @@ class WangCaiEngine:
         self.yanchi_strategy_config = self.config.get('yanchi', {})
         if self.decision_mode == 'yanchi':
             logger.info("[Engine] 颜驰策略已启用（每个币种使用独立实例）")
+            self.quant_strategy = None
+            self.ai_bridge = None
+            self.wyckoff_smc_strategy = None
+            self.trinity_strategy = None
+            self.trinity_llm = None
+            logger.info("[Engine] 其余策略模块未启动，仅保留颜驰策略输出交易计划")
 
         # 4f. 代币预筛选器（代码层快速过滤，减少AI调用次数）
         screener_config = self.config.get('screener', {})
@@ -484,18 +472,19 @@ class WangCaiEngine:
         self.screening_enabled = screener_config.get("enabled", True)
 
         # 4g. LLM二次审核器（可选，对Trinity信号做最终定性判断）
-        llm_config = self.config.get('trinity_llm', {})
-        ai_cfg = self.config.get('ai', {})
-        self.trinity_llm = TrinityLLMDecider({
-            "enabled": llm_config.get("enabled", False),
-            "provider": llm_config.get("provider", ai_cfg.get("provider", "openai")),
-            "api_key": llm_config.get("api_key", "") or ai_cfg.get("api_key", ""),
-            "api_base": llm_config.get("api_base", ai_cfg.get("base_url", "")),
-            "model": llm_config.get("model", ai_cfg.get("model", "gpt-4")),
-            "temperature": llm_config.get("temperature", 0.3),
-            "timeout": llm_config.get("timeout", 30),
-            "fallback_approve": llm_config.get("fallback_approve", False),
-        })
+        if self.decision_mode != 'yanchi':
+            llm_config = self.config.get('trinity_llm', {})
+            ai_cfg = self.config.get('ai', {})
+            self.trinity_llm = TrinityLLMDecider({
+                "enabled": llm_config.get("enabled", False),
+                "provider": llm_config.get("provider", ai_cfg.get("provider", "openai")),
+                "api_key": llm_config.get("api_key", "") or ai_cfg.get("api_key", ""),
+                "api_base": llm_config.get("api_base", ai_cfg.get("base_url", "")),
+                "model": llm_config.get("model", ai_cfg.get("model", "gpt-4")),
+                "temperature": llm_config.get("temperature", 0.3),
+                "timeout": llm_config.get("timeout", 30),
+                "fallback_approve": llm_config.get("fallback_approve", False),
+            })
         logger.info("[Engine] 代币筛选器已加载 (enabled={}, max={}, minVol={})",
                    self.screening_enabled,
                    screener_config.get("max_tokens", 10),
@@ -592,6 +581,8 @@ class WangCaiEngine:
             async def _do_account():
                 logger.info("[3/8] 账户同步...")
                 pf = await self.account_manager.sync_all()
+                self._ensure_protection_orders_for_portfolio(pf)
+                self._cleanup_orphan_algo_orders_for_portfolio(pf)
                 logger.info("[3/8] 账户同步完成")
                 return pf
 
@@ -604,19 +595,38 @@ class WangCaiEngine:
             market_info = results[1]
             portfolio = results[2]
 
-            self.logger_notifier.save_account_snapshot({
-                'timestamp': datetime.now().isoformat(),
-                'accounts': {
-                    name: {
-                        'total_equity_usdt': acc.total_equity_usdt,
-                        'available_usdt': acc.available_usdt,
-                        'position_count': acc.position_count,
-                        'daily_pnl': acc.daily_pnl,
-                        'total_pnl': acc.total_pnl
+            if portfolio.accounts:
+                self.logger_notifier.save_account_snapshot({
+                    'timestamp': datetime.now().isoformat(),
+                    'accounts': {
+                        name: {
+                            'total_equity_usdt': acc.total_equity_usdt,
+                            'available_usdt': acc.available_usdt,
+                            'position_count': acc.position_count,
+                            'daily_pnl': acc.daily_pnl,
+                            'total_pnl': acc.total_pnl,
+                            'positions': [
+                                {
+                                    'symbol': pos.symbol,
+                                    'side': pos.side,
+                                    'amount': pos.amount,
+                                    'entry_price': pos.entry_price,
+                                    'mark_price': pos.mark_price,
+                                    'unrealized_pnl': pos.unrealized_pnl,
+                                    'realized_pnl': pos.realized_pnl,
+                                    'leverage': pos.leverage,
+                                    'exchange': pos.exchange or name,
+                                    'timestamp': pos.timestamp.isoformat() if hasattr(pos.timestamp, 'isoformat') else str(pos.timestamp),
+                                }
+                                for pos in acc.positions
+                                if abs(pos.amount) > 0
+                            ]
+                        }
+                        for name, acc in portfolio.accounts.items()
                     }
-                    for name, acc in portfolio.accounts.items()
-                }
-            })
+                })
+            else:
+                logger.warning("[Account] 本轮账户同步无有效账户，跳过账户快照落库")
 
             # ===== Step 4: 决策（AI / 规则 / 外部AI / WyckoffSMC）=====
             if self.decision_mode == 'ai_external':
@@ -915,7 +925,7 @@ class WangCaiEngine:
             'positions': all_positions,
             'total_equity': portfolio.total_equity,
             'available_usdt': portfolio.total_available,
-            'position_count': portfolio.total_positions
+            'position_count': self._get_live_open_position_count(portfolio)
         }
         
         # 分批调用AI
@@ -991,6 +1001,66 @@ class WangCaiEngine:
             json.dump(payload, f, ensure_ascii=True, indent=2)
             f.write("\n")
         tmp_path.replace(path)
+
+    def _build_yanchi_status(
+        self,
+        candidates: List[Dict[str, Any]],
+        analysis_details: List[Dict[str, Any]],
+        original_total: int,
+        analyzed_total: int,
+        error_count: int,
+    ) -> Dict[str, Any]:
+        """Build status JSON with screening counts separate from trade candidates."""
+        screening = {
+            "total": original_total,
+            "passed": analyzed_total,
+            "rejected": max(0, original_total - analyzed_total),
+            "trade_candidates": len(candidates),
+            "top_tokens": [],
+        }
+        screener_result = getattr(self, '_last_screener_result', None)
+        if screener_result:
+            screening["passed"] = int(getattr(screener_result, 'passed_count', analyzed_total) or 0)
+            screening["rejected"] = int(
+                getattr(
+                    screener_result,
+                    'rejected_count',
+                    max(0, original_total - screening["passed"]),
+                )
+                or 0
+            )
+            for tok in getattr(screener_result, 'passed', [])[:10]:
+                screening["top_tokens"].append({
+                    "symbol": tok.symbol,
+                    "score": round(tok.total_score, 1),
+                    "price": tok.price,
+                    "volume_24h": getattr(tok, 'volume_24h', 0),
+                    "atr_pct": round(getattr(tok, 'atr_pct', 0), 1),
+                    "trend": getattr(tok, 'trend', ''),
+                })
+
+        return {
+            "status": "signals" if candidates else "no_candidates",
+            "cycle": self.cycle_count,
+            "timestamp": datetime.now().isoformat(),
+            "screening": screening,
+            "analysis": {
+                "analyzed": analyzed_total,
+                "errors": error_count,
+                "details": analysis_details,
+            },
+            "signals": [
+                {
+                    "symbol": c["symbol"],
+                    "action": c["action"],
+                    "score": c["score"],
+                    "confidence": c["confidence"],
+                    "price": c["price"],
+                    "reason": c["reason"],
+                }
+                for c in candidates
+            ],
+        }
 
     async def _decision_rule(self, symbols, snapshots, portfolio):
         """
@@ -1116,6 +1186,12 @@ class WangCaiEngine:
 
         executed_count = 0
         for decision in decisions:
+            can_open, live_count, max_positions = self._can_open_new_position(portfolio)
+            if not can_open:
+                logger.warning("[Decision][External] 当前实时持仓已达上限({}/{})，停止开仓",
+                               live_count, max_positions)
+                break
+
             if portfolio.total_positions >= self.risk_control.position_sizing.max_positions:
                 logger.warning("[Decision][External] 已达最大持仓数({})，停止开仓",
                               self.risk_control.position_sizing.max_positions)
@@ -1261,22 +1337,324 @@ class WangCaiEngine:
     #  风控 + 下单（AI / Rule / External 共用）
     # ------------------------------------------------------------------ #
 
+    def _get_live_open_position_count(self, portfolio=None) -> int:
+        """Return the safest available open-position count."""
+        counts = []
+        if portfolio is not None:
+            counts.append(int(getattr(portfolio, "total_positions", 0) or 0))
+
+        if getattr(self, "order_executor", None):
+            try:
+                counts.append(len(self.order_executor.get_positions()))
+            except Exception:
+                pass
+
+        return max(counts) if counts else 0
+
+    def _can_open_new_position(self, portfolio=None) -> tuple[bool, int, int]:
+        """Check whether a new opening trade is still allowed."""
+        live_count = self._get_live_open_position_count(portfolio)
+        max_positions = self.risk_control.position_sizing.max_positions
+        return live_count < max_positions, live_count, max_positions
+
+    def _portfolio_active_symbols(self, portfolio) -> set:
+        """Extract active futures symbols from an account snapshot."""
+        active_symbols = set()
+        for account in getattr(portfolio, "accounts", {}).values():
+            for pos in getattr(account, "positions", []) or []:
+                if abs(float(getattr(pos, "amount", 0) or 0)) <= 0:
+                    continue
+                active_symbols.add(OrderExecutorModule._normalize_futures_symbol(pos.symbol))
+        return active_symbols
+
+    def _exchange_active_symbols(self) -> tuple[set, Optional[str]]:
+        """Best-effort direct exchange position check used before risky cleanup."""
+        if not getattr(self, "order_executor", None):
+            return set(), None
+        getter = getattr(self.order_executor, "get_exchange_active_position_symbols", None)
+        if not callable(getter):
+            return set(), None
+        try:
+            return set(getter() or set()), None
+        except Exception as e:
+            logger.warning("[OrphanCleanup] 交易所真实持仓核验失败: {}", e)
+            return set(), str(e)
+
+    def _ensure_protection_orders_for_portfolio(self, portfolio) -> Dict[str, Any]:
+        """Ensure every synced live position has exchange-side SL/TP protection."""
+        result = {"checked": 0, "protected": 0, "failed": 0, "symbols": [], "errors": []}
+        if not getattr(self, "order_executor", None) or portfolio is None:
+            return result
+
+        try:
+            accounts = getattr(portfolio, "accounts", {}) or {}
+            for account in accounts.values():
+                for pos in getattr(account, "positions", []) or []:
+                    amount = abs(float(getattr(pos, "amount", 0) or 0))
+                    if amount <= 0:
+                        continue
+                    symbol = OrderExecutorModule._normalize_futures_symbol(pos.symbol)
+                    entry_price = float(getattr(pos, "entry_price", 0) or 0)
+                    if not symbol or entry_price <= 0:
+                        continue
+                    side = str(getattr(pos, "side", "") or "").lower()
+                    direction = "SHORT" if side == "short" else "LONG"
+                    brackets = self._build_recovery_brackets(symbol, direction, entry_price)
+                    step_info = self.order_executor._get_symbol_step_size(symbol)
+                    tp_levels = brackets["take_profit_levels"]
+                    if len(tp_levels) == 1:
+                        ratios = [1.0]
+                    elif len(tp_levels) == 2:
+                        ratios = [0.5, 0.5]
+                    elif len(tp_levels) == 3:
+                        ratios = [0.5, 0.3, 0.2]
+                    else:
+                        ratios = [0.5] + [0.5 / (len(tp_levels) - 1)] * (len(tp_levels) - 1)
+                    tp_levels, tp_quantities = OrderExecutorModule._prepare_tp_slices(
+                        qty=amount,
+                        take_profit_levels=tp_levels,
+                        ratios=ratios,
+                        step_size=step_info['step_size'],
+                        min_qty=step_info.get('min_qty', step_info['step_size']),
+                        min_notional=float(step_info.get('min_notional', 5.0) or 5.0),
+                    )
+                    from modules.order_executor import Order, OrderStatus
+                    order = Order(
+                        order_id=f'portfolio_{symbol}_{int(datetime.now().timestamp())}',
+                        symbol=symbol,
+                        direction=direction,
+                        status=OrderStatus.OPENED,
+                        entry_price=entry_price,
+                        entry_time=datetime.now(),
+                        position_size=amount,
+                        leverage=float(getattr(pos, "leverage", 1) or 1),
+                        stop_loss=brackets["stop_loss"],
+                        take_profit_levels=tp_levels,
+                        take_profit_quantities=tp_quantities,
+                        remaining_quantity=amount,
+                    )
+                    result["checked"] += 1
+                    protection = self.order_executor.ensure_protection_orders(order)
+                    if protection.get("has_stop") and protection.get("has_tp"):
+                        result["protected"] += 1
+                    else:
+                        result["failed"] += 1
+                        result["errors"].append(f"{symbol}:missing_protection")
+                    result["symbols"].append(symbol)
+                    logger.info(
+                        "[Protection] {} stop={} tp={} created_stop={} created_tp={}",
+                        symbol,
+                        protection.get("has_stop"),
+                        protection.get("has_tp"),
+                        protection.get("created_stop"),
+                        protection.get("created_tp"),
+                    )
+        except Exception as e:
+            logger.warning("[Protection] 持仓保护单检查失败: {}", e)
+            result["errors"].append(str(e))
+        return result
+
+    def _cleanup_orphan_algo_orders_for_portfolio(self, portfolio) -> Dict[str, Any]:
+        """Clean exchange algo orders for symbols no longer present in portfolio."""
+        if not getattr(self, "order_executor", None) or portfolio is None:
+            return {"checked": 0, "cancelled": 0, "failed": 0, "orphans": [], "errors": []}
+
+        try:
+            active_symbols = self._portfolio_active_symbols(portfolio)
+        except Exception as e:
+            logger.warning("[OrphanCleanup] 提取实时持仓失败，跳过幽灵单清理: {}", e)
+            return {"checked": 0, "cancelled": 0, "failed": 0, "orphans": [], "errors": [str(e)]}
+
+        exchange_symbols, exchange_error = self._exchange_active_symbols()
+        active_symbols |= exchange_symbols
+        if not active_symbols and float(getattr(portfolio, "total_equity", 0) or 0) <= 0 and exchange_error:
+            logger.warning("[OrphanCleanup] 账户同步为空且交易所核验失败，跳过幽灵单清理")
+            return {
+                "checked": 0,
+                "cancelled": 0,
+                "failed": 0,
+                "orphans": [],
+                "errors": ["unverified_empty_portfolio"],
+            }
+
+        try:
+            cleanup = self.order_executor.cleanup_orphan_algo_orders(active_symbols)
+            if cleanup.get("cancelled") or cleanup.get("failed"):
+                logger.info("[OrphanCleanup] checked={} cancelled={} failed={} orphans={}",
+                            cleanup.get("checked"),
+                            cleanup.get("cancelled"),
+                            cleanup.get("failed"),
+                            cleanup.get("orphans"))
+            return cleanup
+        except Exception as e:
+            logger.warning("[OrphanCleanup] 幽灵Algo清理失败: {}", e)
+            return {"checked": 0, "cancelled": 0, "failed": 0, "orphans": [], "errors": [str(e)]}
+
+    def _load_recovery_plan_from_db(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Load the latest persisted SL/TP plan for a recovered position."""
+        try:
+            import sqlite3
+            db_cfg = self.config.get('database', {}) if getattr(self, 'config', None) else {}
+            db_path = Path(db_cfg.get('sqlite_path', 'data/wangcai.db'))
+            if not db_path.is_absolute():
+                db_path = Path(__file__).parent.parent / db_path
+            if not db_path.exists():
+                return None
+
+            normalized = symbol.replace('/', '').replace(':USDT', '').upper()
+            variants = {normalized, symbol.upper()}
+            if normalized.endswith('USDT'):
+                variants.add(f"{normalized[:-4]}/USDT")
+                variants.add(f"{normalized[:-4]}/USDT:USDT")
+
+            rows = []
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if 'trade_journal' in tables:
+                    rows.extend(conn.execute(
+                        """
+                        SELECT symbol, direction, stop_loss, take_profit_levels, entry_time AS ts
+                        FROM trade_journal
+                        ORDER BY entry_time DESC
+                        LIMIT 100
+                        """
+                    ).fetchall())
+                if 'trades' in tables:
+                    trade_cols = {
+                        row[1]
+                        for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+                    }
+                    if {'stop_loss', 'take_profit'}.issubset(trade_cols):
+                        rows.extend(conn.execute(
+                            """
+                            SELECT symbol, action AS direction, stop_loss,
+                                   take_profit AS take_profit_levels, timestamp AS ts
+                            FROM trades
+                            ORDER BY timestamp DESC
+                            LIMIT 100
+                            """
+                        ).fetchall())
+            finally:
+                conn.close()
+
+            for row in rows:
+                row_symbol = str(row['symbol'] or '').upper()
+                row_normalized = row_symbol.replace('/', '').replace(':USDT', '')
+                if row_symbol not in variants and row_normalized not in variants:
+                    continue
+
+                row_direction = str(row['direction'] or '').upper()
+                if direction == 'LONG' and row_direction not in ('LONG', 'BUY'):
+                    continue
+                if direction == 'SHORT' and row_direction not in ('SHORT', 'SELL'):
+                    continue
+
+                sl = row['stop_loss']
+                tp_raw = row['take_profit_levels']
+                if sl in (None, '') or tp_raw in (None, ''):
+                    continue
+                sl = float(sl)
+                if isinstance(tp_raw, str):
+                    try:
+                        tp_levels = json.loads(tp_raw)
+                    except json.JSONDecodeError:
+                        tp_levels = [float(tp_raw)]
+                else:
+                    tp_levels = tp_raw
+                if isinstance(tp_levels, (int, float)):
+                    tp_levels = [float(tp_levels)]
+                tp_levels = [float(tp) for tp in (tp_levels or []) if float(tp) > 0]
+                if not tp_levels:
+                    continue
+
+                if direction == 'LONG' and sl < entry_price and all(tp > entry_price for tp in tp_levels):
+                    return {"stop_loss": sl, "take_profit_levels": tp_levels}
+                if direction == 'SHORT' and sl > entry_price and all(tp < entry_price for tp in tp_levels):
+                    return {"stop_loss": sl, "take_profit_levels": tp_levels}
+        except Exception as e:
+            logger.debug("[Recover] 读取历史交易计划失败: {} | {}", symbol, e)
+        return None
+
+    def _build_recovery_brackets(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+    ) -> Dict[str, Any]:
+        """Build SL/TP for recovered positions, preferring persisted plans."""
+        persisted = self._load_recovery_plan_from_db(symbol, direction, entry_price)
+        if persisted:
+            return persisted
+
+        mode = getattr(self, 'decision_mode', None) or self.config.get('system', {}).get('decision_mode', '')
+        if mode == 'yanchi':
+            yanchi_cfg = self.config.get('yanchi', {})
+            risk_cfg = self.config.get('risk', {})
+            risk_pct = float(
+                yanchi_cfg.get('stop_loss_pct')
+                or risk_cfg.get('stop_loss_pct')
+                or risk_cfg.get('max_risk_per_trade')
+                or 0.02
+            )
+            min_rr = float(yanchi_cfg.get('min_rr_ratio', 2.0))
+        else:
+            trinity_cfg = self.config.get('trinity', {})
+            risk_cfg = trinity_cfg.get('risk', {})
+            tp_cfg = trinity_cfg.get('take_profit', {})
+            risk_pct = float(risk_cfg.get('max_risk_per_trade', 0.02))
+            min_rr = float(tp_cfg.get('min_rr_ratio', 2.0))
+
+        if direction == 'LONG':
+            sl = round(entry_price * (1 - risk_pct), 6)
+            tp_levels = [
+                round(entry_price * (1 + risk_pct * min_rr), 6),
+                round(entry_price * (1 + risk_pct * min_rr * 1.5), 6),
+                round(entry_price * (1 + risk_pct * min_rr * 2.0), 6),
+            ]
+        else:
+            sl = round(entry_price * (1 + risk_pct), 6)
+            tp_levels = [
+                round(entry_price * (1 - risk_pct * min_rr), 6),
+                round(entry_price * (1 - risk_pct * min_rr * 1.5), 6),
+                round(entry_price * (1 - risk_pct * min_rr * 2.0), 6),
+            ]
+        return {"stop_loss": sl, "take_profit_levels": tp_levels}
+
     async def _execute_decision(self, decision, snapshot, portfolio):
         """风控审核 + 订单执行（AI和规则策略共用）"""
         # ===== Step 5: 风控审核 =====
         logger.info("[5/8] 风控审核...")
+        live_position_count = self._get_live_open_position_count(portfolio)
+        if decision.action in (ActionType.BUY, ActionType.SELL) and live_position_count >= self.risk_control.position_sizing.max_positions:
+            logger.warning("[Order] 当前实时持仓已达上限({}/{})，跳过开仓 {}",
+                           live_position_count, self.risk_control.position_sizing.max_positions, decision.symbol)
+            return
+
         daily_pnl = self.account_manager.get_daily_pnl()
 
         decision_dict = decision.to_dict()
         # 将 price 映射为 entry_price，确保盈亏比检查数据流正确
         if 'price' in decision_dict and 'entry_price' not in decision_dict:
             decision_dict['entry_price'] = decision_dict['price']
+        decision_id = f"{decision.symbol}_{int(datetime.now().timestamp())}"
         risk_report = self.risk_control.check(
             decision=decision_dict,
             account={
                 'total_equity': portfolio.total_equity,
                 'available_usdt': portfolio.total_available,
-                'position_count': portfolio.total_positions,
+                'position_count': live_position_count,
                 # Fix: 传递已持仓代币符号，用于重复下单检查
                 'existing_symbols': [p.symbol for p in self.order_executor.get_positions()],
             },
@@ -1285,7 +1663,7 @@ class WangCaiEngine:
 
         self.logger_notifier.save_risk_check({
             'timestamp': datetime.now().isoformat(),
-            'decision_id': f"{decision.symbol}_{datetime.now().timestamp():.0f}",
+            'decision_id': decision_id,
             'overall_level': risk_report.overall_level.value,
             'is_passed': risk_report.is_passed,
             'checks': [
@@ -1372,6 +1750,53 @@ class WangCaiEngine:
                         'raw': result
                     }
                     self.logger_notifier.save_trade(trade_record)
+                    self.logger_notifier.save_trade_journal({
+                        'trade_id': trade_record.get('order_id', decision_id),
+                        'order_id': trade_record.get('order_id', ''),
+                        'decision_id': decision_id,
+                        'symbol': trade_record.get('symbol', decision.symbol),
+                        'direction': 'LONG' if decision.action == ActionType.BUY else 'SHORT',
+                        'status': trade_record.get('status', ''),
+                        'strategy': decision_dict.get('strategy') or (
+                            'yanchi' if '[YanChi]' in (decision.reason or '') else
+                            'trinity' if '[Trinity]' in (decision.reason or '') else
+                            decision_dict.get('timeframe', 'default')
+                        ),
+                        'entry_time': trade_record.get('timestamp', datetime.now().isoformat()),
+                        'entry_price': trade_record.get('price', 0),
+                        'stop_loss': decision_dict.get('stop_loss'),
+                        'take_profit_levels': decision_dict.get('take_profit') or [],
+                        'initial_risk_usdt': 0,
+                        'initial_risk_pct': 0,
+                        'fees': trade_record.get('fee', 0),
+                        'funding_fee': 0,
+                        'gross_pnl': trade_record.get('pnl', 0),
+                        'net_pnl': trade_record.get('pnl', 0) - trade_record.get('fee', 0),
+                        'r_multiple': 0,
+                        'signal_reason': decision.reason,
+                        'setup_reason': decision.reason,
+                        'risk_passed': risk_report.is_passed,
+                        'risk_level': risk_report.overall_level.value,
+                        'risk_checks': [
+                            {'rule_name': c.rule_name, 'passed': c.passed,
+                             'level': c.level.value, 'message': c.message}
+                            for c in risk_report.checks
+                        ],
+                        'trend_4h': decision_dict.get('trend_4h', ''),
+                        'raw_trade': trade_record,
+                        'raw_decision': decision_dict,
+                        'raw_risk': {
+                            'timestamp': datetime.now().isoformat(),
+                            'decision_id': decision_id,
+                            'overall_level': risk_report.overall_level.value,
+                            'is_passed': risk_report.is_passed,
+                            'checks': [
+                                {'rule_name': c.rule_name, 'passed': c.passed,
+                                 'level': c.level.value, 'message': c.message}
+                                for c in risk_report.checks
+                            ],
+                        },
+                    })
                     await self.logger_notifier.notify_trade(trade_record)
                     # Fix P0-2: 开仓成功不调用 record_trade_result — 只有平仓后才更新 daily_pnl/consecutive_losses
                     # 以下行已删除: pnl_value = ... ; await self.risk_control.record_trade_result(...)
@@ -1392,7 +1817,7 @@ class WangCaiEngine:
             logger.info("[Order] 📝 模拟下单: {} {} {} {} (Paper Trading)",
                        decision.action.value, decision.symbol,
                        decision.amount, decision.price or '市价')
-            self.logger_notifier.save_trade({
+            trade_record = {
                 'timestamp': datetime.now().isoformat(),
                 'order_id': f"PAPER_{datetime.now().timestamp():.0f}",
                 'symbol': decision.symbol,
@@ -1403,6 +1828,54 @@ class WangCaiEngine:
                 'exchange': 'paper',
                 'status': 'filled',
                 'raw': {'mode': 'paper', 'decision': decision.to_dict()}
+            }
+            self.logger_notifier.save_trade(trade_record)
+            self.logger_notifier.save_trade_journal({
+                'trade_id': trade_record.get('order_id', decision_id),
+                'order_id': trade_record.get('order_id', ''),
+                'decision_id': decision_id,
+                'symbol': trade_record.get('symbol', decision.symbol),
+                'direction': 'LONG' if decision.action == ActionType.BUY else 'SHORT',
+                'status': trade_record.get('status', ''),
+                'strategy': decision_dict.get('strategy') or (
+                    'yanchi' if '[YanChi]' in (decision.reason or '') else
+                    'trinity' if '[Trinity]' in (decision.reason or '') else
+                    decision_dict.get('timeframe', 'default')
+                ),
+                'entry_time': trade_record.get('timestamp', datetime.now().isoformat()),
+                'entry_price': trade_record.get('price', 0),
+                'stop_loss': decision_dict.get('stop_loss'),
+                'take_profit_levels': decision_dict.get('take_profit') or [],
+                'initial_risk_usdt': 0,
+                'initial_risk_pct': 0,
+                'fees': 0,
+                'funding_fee': 0,
+                'gross_pnl': 0,
+                'net_pnl': 0,
+                'r_multiple': 0,
+                'signal_reason': decision.reason,
+                'setup_reason': decision.reason,
+                'risk_passed': risk_report.is_passed,
+                'risk_level': risk_report.overall_level.value,
+                'risk_checks': [
+                    {'rule_name': c.rule_name, 'passed': c.passed,
+                     'level': c.level.value, 'message': c.message}
+                    for c in risk_report.checks
+                ],
+                'trend_4h': decision_dict.get('trend_4h', ''),
+                'raw_trade': trade_record,
+                'raw_decision': decision_dict,
+                'raw_risk': {
+                    'timestamp': datetime.now().isoformat(),
+                    'decision_id': decision_id,
+                    'overall_level': risk_report.overall_level.value,
+                    'is_passed': risk_report.is_passed,
+                    'checks': [
+                        {'rule_name': c.rule_name, 'passed': c.passed,
+                         'level': c.level.value, 'message': c.message}
+                        for c in risk_report.checks
+                    ],
+                },
             })
 
     # ------------------------------------------------------------------ #
@@ -1470,7 +1943,11 @@ class WangCaiEngine:
                     break
                     
                 logger.info("[8/8] 📊 每日复盘开始...")
-                await self.daily_review.generate_report()
+                db_cfg = self.config.get('database', {}) if getattr(self, 'config', None) else {}
+                db_path = Path(db_cfg.get('sqlite_path', 'data/wangcai.db'))
+                if not db_path.is_absolute():
+                    db_path = Path(__file__).parent.parent / db_path
+                await self.daily_review.generate_report(str(db_path))
                 logger.info("[8/8] ✅ 每日复盘完成")
                     
             except Exception as e:
@@ -1739,7 +2216,7 @@ class WangCaiEngine:
             account_info = {
                 'total_equity': portfolio.total_equity,
                 'available_usdt': portfolio.total_available,
-                'position_count': portfolio.total_positions,
+                'position_count': self._get_live_open_position_count(portfolio),
             }
             
             # 当前持仓
@@ -1793,6 +2270,12 @@ class WangCaiEngine:
         logger.info("[Trinity][Step3] 执行 {} 个AI审核通过的决策...", len(ai_decisions))
         
         for decision in ai_decisions:
+            can_open, live_count, max_positions = self._can_open_new_position(portfolio)
+            if not can_open:
+                logger.warning("[Trinity][Step3] 当前实时持仓已达上限({}/{})，停止开仓",
+                               live_count, max_positions)
+                break
+
             try:
                 # Fix: 同一代币已持仓则跳过，防止重复开仓
                 held_symbols = [p.symbol.replace('/', '') for p in self.order_executor.get_positions()]
@@ -1876,6 +2359,9 @@ class WangCaiEngine:
             if snap is None:
                 continue
             current_price = snap.avg_price
+            if current_price is None or current_price <= 0:
+                logger.warning("[Monitor] {} 行情价格无效({})，跳过本地止盈止损检查", symbol, current_price)
+                continue
             direction_mult = 1 if pos.direction == 'LONG' else -1
 
             # === Check stop loss（始终全量平仓）===
@@ -1975,66 +2461,105 @@ class WangCaiEngine:
             
             session = self.order_executor.session
             base_url = self.order_executor.futures_base_url
+            self._synced_positions = {}
             
-            ts = int(time.time() * 1000)
-            qs = f'timestamp={ts}'
-            sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-            url = f'{base_url}/fapi/v2/positionRisk?{qs}&signature={sig}'
+            def fetch_positions(timestamp_ms: int, recv_window: int = 60000):
+                qs = f'timestamp={timestamp_ms}&recvWindow={recv_window}'
+                sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+                url = f'{base_url}/fapi/v2/positionRisk?{qs}&signature={sig}'
+                return session.get(url, headers={'X-MBX-APIKEY': api_key}, timeout=30)
+
             logger.info(f"[Recover] 正在从交易所获取持仓信息...")
-            resp = session.get(url, headers={'X-MBX-APIKEY': api_key}, timeout=30)
-            positions = resp.json()
+            resp = fetch_positions(int(time.time() * 1000))
+            try:
+                payload = resp.json()
+            except Exception as json_err:
+                logger.warning("[Recover] 持仓接口返回非 JSON | HTTP {} | {}", resp.status_code, json_err)
+                logger.debug("[Recover] 原始响应: {}", getattr(resp, "text", "")[:300])
+                return
+
+            if resp.status_code == 400 and isinstance(payload, dict) and payload.get('code') == -1021:
+                try:
+                    time_resp = session.get(f"{base_url}/fapi/v1/time", timeout=10)
+                    time_payload = time_resp.json()
+                    server_ts = int(time_payload.get('serverTime', 0))
+                    if server_ts > 0:
+                        local_ts = int(time.time() * 1000)
+                        offset = server_ts - local_ts
+                        logger.info("[Recover] 已同步交易所时间偏移: {}ms，重试持仓恢复", offset)
+                        resp = fetch_positions(server_ts)
+                        payload = resp.json()
+                except Exception as sync_err:
+                    logger.warning("[Recover] 时间同步失败，跳过重试: {}", sync_err)
+
+            if resp.status_code != 200:
+                logger.warning("[Recover] 持仓接口HTTP {} | {}", resp.status_code, payload)
+                return
+
+            if not isinstance(payload, list):
+                logger.warning("[Recover] 持仓接口返回非列表，跳过恢复: {}", payload)
+                return
+
+            positions = payload
             
             from modules.order_executor import Order, OrderStatus
-            self._synced_positions = {}
+            exchange_active_symbols = set()
             for p in positions:
+                if not isinstance(p, dict):
+                    logger.warning("[Recover] 跳过异常持仓条目: {}", p)
+                    continue
                 amt = float(p['positionAmt'])
                 if amt == 0:
                     continue
                 
                 symbol = p['symbol']
+                exchange_active_symbols.add(symbol)
                 entry_price = float(p['entryPrice'])
                 direction = 'LONG' if amt > 0 else 'SHORT'
                 qty = abs(amt)
                 # 从API响应中读取实际杠杆倍数（不再硬编码为1.0）
                 actual_leverage = float(p.get('leverage', 1.0))
                 
-                # 根据三位一体策略配置计算止损/止盈（与策略一致）
-                trinity_cfg = self.config.get('trinity', {})
-                risk_cfg = trinity_cfg.get('risk', {})
-                tp_cfg = trinity_cfg.get('take_profit', {})
-                
-                max_risk_pct = risk_cfg.get('max_risk_per_trade', 0.02)      # 默认2%
-                min_rr = tp_cfg.get('min_rr_ratio', 2.0)                     # 最小盈亏比2:1
-                
+                brackets = self._build_recovery_brackets(symbol, direction, entry_price)
+                sl = brackets["stop_loss"]
+                take_profit_levels = brackets["take_profit_levels"]
+
                 if direction == 'LONG':
-                    sl = round(entry_price * (1 - max_risk_pct), 6)
                     # Fix: 如果当前价已低于止损，跳过恢复（避免立即触发）
                     current_price = float(p.get('markPrice', entry_price))
                     if current_price < sl:
                         logger.warning("[Recover] {} 当前价 ${:.4f} < 止损 ${:.4f}，"
                                       "跳过恢复（仓位已深度亏损）", symbol, current_price, sl)
                         continue
-                    tp1 = round(entry_price * (1 + max_risk_pct * min_rr), 6)       # 2:1
-                    tp2 = round(entry_price * (1 + max_risk_pct * min_rr * 1.5), 6) # 3:1
-                    tp3 = round(entry_price * (1 + max_risk_pct * min_rr * 2.0), 6) # 4:1
                 else:
-                    sl = round(entry_price * (1 + max_risk_pct), 6)
                     # Fix: 如果当前价已高于止损，跳过恢复
                     current_price = float(p.get('markPrice', entry_price))
                     if current_price > sl:
                         logger.warning("[Recover] {} 当前价 ${:.4f} > 止损 ${:.4f}，"
                                       "跳过恢复（仓位已深度亏损）", symbol, current_price, sl)
                         continue
-                    tp1 = round(entry_price * (1 - max_risk_pct * min_rr), 6)
-                    tp2 = round(entry_price * (1 - max_risk_pct * min_rr * 1.5), 6)
-                    tp3 = round(entry_price * (1 - max_risk_pct * min_rr * 2.0), 6)
                 
                 # 计算分批止盈数量，使用 step_size 保护避免小仓位归零
                 step_info = self.order_executor._get_symbol_step_size(symbol)
                 step_size = step_info['step_size']
-                part1 = math.floor(qty * 0.5 / step_size) * step_size
-                part2 = math.floor(qty * 0.3 / step_size) * step_size
-                part3 = max(0, qty - part1 - part2)
+                min_qty = step_info.get('min_qty', step_size)
+                min_notional = float(step_info.get('min_notional', 5.0) or 5.0)
+                if len(take_profit_levels) == 1:
+                    ratios = [1.0]
+                elif len(take_profit_levels) == 2:
+                    ratios = [0.5, 0.5]
+                elif len(take_profit_levels) == 3:
+                    ratios = [0.5, 0.3, 0.2]
+                else:
+                    ratios = [0.5] + [0.5 / (len(take_profit_levels) - 1)] * (len(take_profit_levels) - 1)
+                take_profit_levels, tp_quantities = OrderExecutorModule._prepare_tp_slices(
+                    qty=qty,
+                    take_profit_levels=take_profit_levels,
+                    ratios=ratios,
+                    step_size=step_size,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
                 
                 order = Order(
                     order_id=f'recovered_{symbol}_{int(time.time())}',
@@ -2046,15 +2571,36 @@ class WangCaiEngine:
                     position_size=qty,
                     leverage=actual_leverage,  # 从交易所API读取实际杠杆
                     stop_loss=sl,
-                    take_profit_levels=[tp1, tp2, tp3],
-                    take_profit_quantities=[part1, part2, part3],
+                    take_profit_levels=take_profit_levels,
+                    take_profit_quantities=tp_quantities,
                     remaining_quantity=qty
                 )
                 
                 self.order_executor.positions.append(order)
                 self._synced_positions[symbol] = order
+                try:
+                    protection = self.order_executor.ensure_protection_orders(order)
+                    logger.info("[Recover] 保护单检查: {} stop={} tp={} created_stop={} created_tp={}",
+                                symbol,
+                                protection.get("has_stop"),
+                                protection.get("has_tp"),
+                                protection.get("created_stop"),
+                                protection.get("created_tp"))
+                except Exception as protect_err:
+                    logger.warning("[Recover] 保护单检查/补挂失败: {} | {}", symbol, protect_err)
                 logger.info(f"[Recover] 恢复持仓: {symbol} {direction} {qty}币 @ {entry_price} "
-                       f"SL={sl} TP={tp1}/{tp2}/{tp3} RR={min_rr}:1")
+                       f"SL={sl} TP={take_profit_levels}")
+
+            try:
+                cleanup = self.order_executor.cleanup_orphan_algo_orders(exchange_active_symbols)
+                if cleanup.get("cancelled") or cleanup.get("failed"):
+                    logger.info("[Recover] 幽灵Algo清理: checked={} cancelled={} failed={} orphans={}",
+                                cleanup.get("checked"),
+                                cleanup.get("cancelled"),
+                                cleanup.get("failed"),
+                                cleanup.get("orphans"))
+            except Exception as cleanup_err:
+                logger.warning("[Recover] 幽灵Algo清理失败: {}", cleanup_err)
             
             if not self._synced_positions:
                 logger.info("[Recover] 交易所无持仓")

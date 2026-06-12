@@ -105,14 +105,15 @@ class RiskControlModule:
                     f"日亏损限额: ${self.max_daily_loss_usdt} ({self.max_daily_loss_pct*100:.1f}%) | "
                     f"熔断: {self.circuit_breaker_enabled} (连续{self.consecutive_loss_limit}次亏损/日亏{self.daily_loss_trigger_pct*100:.1f}%)")
     
-    def check_position_limit(self) -> RiskCheckResult:
+    def check_position_limit(self, current_count: Optional[int] = None) -> RiskCheckResult:
         """
         检查持仓数量限制
         
         Returns:
             RiskCheckResult
         """
-        current_count = len(self.current_positions)
+        if current_count is None:
+            current_count = len(self.current_positions)
         max_allowed = self.position_sizing.max_positions
         
         if current_count >= max_allowed:
@@ -589,11 +590,12 @@ class RiskControlModule:
             ))
         
         # 3. 持仓数量检查
-        pos_result = self.check_position_limit()
+        live_position_count = account.get('position_count')
+        pos_result = self.check_position_limit(live_position_count)
         checks.append(RiskCheckItem(
             name="position_limit",
             result=pos_result,
-            message=f"持仓 {len(self.current_positions)}/{self.position_sizing.max_positions}"
+            message=f"持仓 {live_position_count if live_position_count is not None else len(self.current_positions)}/{self.position_sizing.max_positions}"
         ))
 
         # 3b. 重复下单检查：已持有的代币不允许再开仓

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 订单执行模块
 
@@ -111,6 +111,30 @@ class OrderExecutorModule:
         return round(math.floor(raw_qty / step_size) * step_size, decimals)
 
     @staticmethod
+    def _make_client_order_id(prefix: str, source_id: str, max_length: int = 36) -> str:
+        """生成满足 Binance 长度限制的客户端订单 ID。"""
+        import re
+
+        safe_prefix = re.sub(r"[^A-Za-z0-9_-]", "", prefix or "")
+        safe_source = re.sub(r"[^A-Za-z0-9_-]", "", source_id or "")
+        if max_length <= 0:
+            return ""
+
+        base = f"{safe_prefix}{safe_source}"
+        if len(base) <= max_length:
+            return base
+
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+        separator = "_" if safe_prefix else ""
+        available = max_length - len(safe_prefix) - len(separator) - len(digest)
+        if available <= 0:
+            prefix_part = safe_prefix[:max(0, max_length - len(digest))]
+            return f"{prefix_part}{digest}"[:max_length]
+
+        source_part = safe_source[:available]
+        return f"{safe_prefix}{source_part}{separator}{digest}"
+
+    @staticmethod
     def _split_qty(total_qty: float, ratios: list, step_size: float,
                    min_qty: float) -> tuple:
         """按比例分割仓位并对齐step_size
@@ -145,6 +169,56 @@ class OrderExecutorModule:
 
         return aligned_qtys, valid_levels
 
+    @staticmethod
+    def _normalize_futures_symbol(symbol: str) -> str:
+        """Convert local symbols like BTC/USDT:USDT to Binance BTCUSDT."""
+        symbol = (symbol or "").strip().upper()
+        if "/" in symbol:
+            base, rest = symbol.split("/", 1)
+            quote = rest.split(":", 1)[0]
+            return f"{base}{quote}"
+        return symbol.split(":", 1)[0]
+
+    @staticmethod
+    def _prepare_tp_slices(
+        qty: float,
+        take_profit_levels: List[float],
+        ratios: List[float],
+        step_size: float,
+        min_qty: float,
+        min_notional: float = 5.0,
+    ) -> Tuple[List[float], List[float]]:
+        """Prepare TP levels/quantities, collapsing tiny partials to one full TP."""
+        if not take_profit_levels or qty <= 0:
+            return [], []
+
+        aligned_qtys, valid_levels = OrderExecutorModule._split_qty(
+            qty, ratios, step_size, min_qty
+        )
+        pairs = []
+        for idx in valid_levels:
+            if idx >= len(take_profit_levels) or idx >= len(aligned_qtys):
+                continue
+            level = float(take_profit_levels[idx])
+            level_qty = float(aligned_qtys[idx])
+            if level_qty >= min_qty and level_qty * level >= min_notional:
+                pairs.append((level, level_qty))
+
+        if not pairs:
+            return [float(take_profit_levels[0])], [qty]
+
+        total_qty = round(sum(q for _, q in pairs), 12)
+        if abs(total_qty - qty) > max(step_size, 1e-12) * 0.01:
+            logger.warning(
+                "[OrderExecutor] 分批TP因最小名义价值过滤后总量{} != 仓位{}，"
+                "降级为1级全量TP",
+                total_qty,
+                qty,
+            )
+            return [float(take_profit_levels[0])], [qty]
+
+        return [p for p, _ in pairs], [q for _, q in pairs]
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         初始化订单执行模块
@@ -157,7 +231,7 @@ class OrderExecutorModule:
         # 币安API配置
         self.api_key = config.get('api_key', '')
         self.api_secret = config.get('api_secret', '')
-        self.testnet = config.get('testnet', True)  # 默认使用测试网
+        self.testnet = config.get('testnet', config.get('sandbox', True))  # 默认使用测试网
         
         # API端点
         if self.testnet:
@@ -228,21 +302,30 @@ class OrderExecutorModule:
                 sym = s['symbol']
                 for f in s.get('filters', []):
                     if f['filterType'] == 'LOT_SIZE':
+                        min_notional = 5.0
+                        for nf in s.get('filters', []):
+                            if nf.get('filterType') in ('MIN_NOTIONAL', 'NOTIONAL'):
+                                min_notional = float(
+                                    nf.get('notional')
+                                    or nf.get('minNotional')
+                                    or min_notional
+                                )
                         info = {
                             'step_size': float(f['stepSize']),
                             'min_qty': float(f['minQty']),
-                            'max_qty': float(f['maxQty'])
+                            'max_qty': float(f['maxQty']),
+                            'min_notional': min_notional,
                         }
                         self._step_size_cache[sym] = info
                         self._step_size_cache_time[sym] = now_ts  # Fix #2: 记录缓存时间
             if symbol not in self._step_size_cache:
                 # fallback
                 logger.warning(f"[OrderExecutor] 未找到 {symbol} 的精度信息，使用默认值")
-                self._step_size_cache[symbol] = {'step_size': 1, 'min_qty': 1, 'max_qty': 10000000}
+                self._step_size_cache[symbol] = {'step_size': 1, 'min_qty': 1, 'max_qty': 10000000, 'min_notional': 5.0}
                 self._step_size_cache_time[symbol] = now_ts  # Fix #2: fallback也记时
         except Exception as e:
             logger.warning(f"[OrderExecutor] 获取符号精度失败: {e}，使用默认值")
-            self._step_size_cache[symbol] = {'step_size': 1, 'min_qty': 1, 'max_qty': 10000000}
+            self._step_size_cache[symbol] = {'step_size': 1, 'min_qty': 1, 'max_qty': 10000000, 'min_notional': 5.0}
             self._step_size_cache_time[symbol] = now_ts  # Fix #2: 异常也记时
         
         return self._step_size_cache[symbol]
@@ -410,6 +493,7 @@ class OrderExecutorModule:
         step_info = self._get_symbol_step_size(symbol)
         step_size = step_info['step_size']
         min_qty = step_info['min_qty']
+        min_notional = float(step_info.get('min_notional', 5.0) or 5.0)
         # Fix #4: 使用 math.floor 做精度适配，不用 int() 强转
         import math
         qty = math.floor(position_size / step_size) * step_size
@@ -448,7 +532,7 @@ class OrderExecutorModule:
         # 1. 生成订单ID
         self.order_counter += 1
         order_id = f"WC_{int(time.time())}_{self.order_counter}"
-        client_order_id = order_id  # 用于幂等性
+        client_order_id = self._make_client_order_id("WC_", order_id)  # 用于幂等性
         
         logger.info(f"[OrderExecutor] 开仓: {symbol} {direction}")
         logger.info(f"  入场价: ${entry_price:.6f}")
@@ -586,27 +670,15 @@ class OrderExecutorModule:
             else:
                 ratios = [0.5] + [0.5 / (n_levels - 1)] * (n_levels - 1)
 
-            # 分割+对齐+余量修复
-            aligned_qtys, valid_levels = self._split_qty(
-                qty, ratios, step_size, min_qty
+            take_profit_levels, aligned_qtys = self._prepare_tp_slices(
+                qty=qty,
+                take_profit_levels=take_profit_levels,
+                ratios=ratios,
+                step_size=step_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
             )
-
-            # 极小仓位降级：如果有效级别为0，合并为1级全量
-            if not valid_levels and n_levels >= 1:
-                logger.warning(f"[OrderExecutor] 分批TP全部数量 < min_qty({min_qty}), "
-                              f"降级为1级全量TP")
-                aligned_qtys = [qty]
-                valid_levels = [0]
-                take_profit_levels = [take_profit_levels[0]]
-                n_levels = 1
-
-            # 如果某些级别无效，裁剪到仅有效级别
-            if len(valid_levels) < n_levels:
-                logger.warning(f"[OrderExecutor] 部分TP级别数量 < min_qty, "
-                              f"仅保留{len(valid_levels)}级")
-                take_profit_levels = [take_profit_levels[i] for i in valid_levels]
-                aligned_qtys = [aligned_qtys[i] for i in valid_levels]
-                n_levels = len(valid_levels)
+            n_levels = len(take_profit_levels)
 
             tp_side = 'SELL' if direction == 'LONG' else 'BUY'
             for i, (tp_price, tp_qty) in enumerate(zip(take_profit_levels, aligned_qtys)):
@@ -632,7 +704,7 @@ class OrderExecutorModule:
                     logger.info(f"[OrderExecutor] ✅ 止盈{i+1}订单成功 | "
                                 f"价位: ${tp_price:.6f} | "
                                 f"数量: {tp_qty} | "
-                                f"比例: {ratios[i]*100:.0f}% | "
+                                f"比例: {tp_qty / qty * 100:.0f}% | "
                                 f"algoId: {tp_order.get('algoId')}")
                     _has_exchange_tp = True
 
@@ -817,6 +889,242 @@ class OrderExecutorModule:
     # Validated: 2026-05-31
     # positionSide valid values: BOTH (one-way) | LONG | SHORT (hedge mode)
 
+    def cleanup_orphan_algo_orders(self, active_symbols: set) -> Dict[str, Any]:
+        """Cancel open algo orders whose symbol has no live position."""
+        active = {
+            self._normalize_futures_symbol(symbol)
+            for symbol in (active_symbols or set())
+            if symbol
+        }
+        result = {
+            "checked": 0,
+            "cancelled": 0,
+            "failed": 0,
+            "orphans": [],
+            "errors": [],
+        }
+        try:
+            open_algos = self._send_algo_request(
+                'GET', '/fapi/v1/openAlgoOrders', params={}, signed=True,
+            )
+        except Exception as e:
+            logger.warning("[OrderExecutor] 查询Algo订单失败，无法清理幽灵单: {}", e)
+            result["errors"].append(str(e))
+            return result
+
+        if isinstance(open_algos, dict):
+            open_algos = open_algos.get('orders') or open_algos.get('data') or []
+        if not isinstance(open_algos, list):
+            return result
+
+        for ao in open_algos:
+            if not isinstance(ao, dict):
+                continue
+            status = str(ao.get('algoStatus') or ao.get('status') or 'NEW').upper()
+            if status not in ('NEW', 'PARTIALLY_FILLED'):
+                continue
+            symbol = self._normalize_futures_symbol(str(ao.get('symbol') or ''))
+            algo_id = ao.get('algoId')
+            result["checked"] += 1
+            if not symbol or symbol in active:
+                continue
+            try:
+                self._send_algo_request(
+                    'DELETE',
+                    '/fapi/v1/algoOrder',
+                    params={'symbol': symbol, 'algoId': algo_id},
+                    signed=True,
+                )
+                result["cancelled"] += 1
+                result["orphans"].append(f"{symbol}:{algo_id}")
+                logger.info("[OrderExecutor] 已清理无持仓幽灵Algo单: {} | {}", symbol, algo_id)
+            except Exception as e:
+                result["failed"] += 1
+                result["errors"].append(f"{symbol}:{algo_id}:{e}")
+                logger.warning("[OrderExecutor] 清理幽灵Algo单失败: {} | {} | {}", symbol, algo_id, e)
+
+        return result
+
+    def get_exchange_active_position_symbols(self) -> set:
+        """Read live futures positions directly from Binance and return active symbols."""
+        positions = self._send_request(
+            'GET',
+            '/fapi/v2/positionRisk',
+            params={},
+            signed=True,
+            use_futures=True,
+        )
+        active = set()
+        if not isinstance(positions, list):
+            return active
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            try:
+                amount = float(pos.get('positionAmt') or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if abs(amount) <= 0:
+                continue
+            symbol = self._normalize_futures_symbol(str(pos.get('symbol') or ''))
+            if symbol:
+                active.add(symbol)
+        return active
+
+    def ensure_protection_orders(self, order: Order) -> Dict[str, Any]:
+        """Ensure an open position has exchange-side STOP/TP algo protection."""
+        symbol = self._normalize_futures_symbol(order.symbol)
+        direction = (order.direction or "").upper()
+        pos_side = "LONG" if direction == "LONG" else "SHORT"
+        close_side = "SELL" if pos_side == "LONG" else "BUY"
+        qty = float(order.remaining_quantity or order.position_size or 0)
+        result = {
+            "has_stop": False,
+            "has_tp": False,
+            "created_stop": False,
+            "created_tp": 0,
+        }
+        if not symbol or qty <= 0:
+            return result
+
+        try:
+            open_algos = self._send_algo_request(
+                'GET', '/fapi/v1/openAlgoOrders',
+                params={'symbol': symbol}, signed=True,
+            )
+        except Exception as e:
+            logger.warning("[OrderExecutor] 查询保护单失败，跳过补挂: {} | {}", symbol, e)
+            return result
+
+        if isinstance(open_algos, dict):
+            open_algos = open_algos.get('orders') or open_algos.get('data') or []
+        if not isinstance(open_algos, list):
+            open_algos = []
+
+        def is_open(ao: Dict[str, Any]) -> bool:
+            return str(ao.get('algoStatus') or ao.get('status') or 'NEW').upper() in (
+                'NEW', 'PARTIALLY_FILLED'
+            )
+
+        def algo_type(ao: Dict[str, Any]) -> str:
+            return str(
+                ao.get('orderType')
+                or ao.get('type')
+                or ao.get('origType')
+                or ''
+            ).upper()
+
+        def trigger_price(ao: Dict[str, Any]) -> float:
+            raw = ao.get('triggerPrice') or ao.get('stopPrice') or ao.get('price') or 0
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+
+        open_algos = [ao for ao in open_algos if isinstance(ao, dict) and is_open(ao)]
+        stop_orders = [ao for ao in open_algos if algo_type(ao) == 'STOP_MARKET']
+        tp_orders = [ao for ao in open_algos if algo_type(ao) == 'TAKE_PROFIT_MARKET']
+        result["has_stop"] = bool(stop_orders)
+        result["has_tp"] = bool(tp_orders)
+
+        if not stop_orders and order.stop_loss and order.stop_loss > 0:
+            try:
+                stop_order = self._send_algo_request(
+                    'POST',
+                    '/fapi/v1/algoOrder',
+                    params={
+                        'symbol': symbol,
+                        'side': close_side,
+                        'type': 'STOP_MARKET',
+                        'algoType': 'CONDITIONAL',
+                        'triggerPrice': f"{float(order.stop_loss):.6f}",
+                        'quantity': str(qty),
+                        'positionSide': pos_side,
+                        'workingType': 'CONTRACT_PRICE',
+                    },
+                    signed=True,
+                )
+                order.order_ids.append(str(stop_order.get('algoId', '')))
+                result["has_stop"] = True
+                result["created_stop"] = True
+                logger.info("[OrderExecutor] 已补挂止损保护单: {} | {}", symbol, stop_order.get('algoId'))
+            except Exception as e:
+                logger.warning("[OrderExecutor] 补挂止损失败: {} | {}", symbol, e)
+
+        existing_tp_prices = [trigger_price(ao) for ao in tp_orders]
+        tp_levels = [float(x) for x in (order.take_profit_levels or []) if x]
+        tp_qtys = list(order.take_profit_quantities or [])
+        if len(tp_qtys) != len(tp_levels):
+            if tp_levels:
+                if len(tp_levels) == 1:
+                    ratios = [1.0]
+                elif len(tp_levels) == 2:
+                    ratios = [0.5, 0.5]
+                elif len(tp_levels) == 3:
+                    ratios = [0.5, 0.3, 0.2]
+                else:
+                    ratios = [0.5] + [0.5 / (len(tp_levels) - 1)] * (len(tp_levels) - 1)
+                step_info = self._get_symbol_step_size(symbol)
+                tp_levels, tp_qtys = self._prepare_tp_slices(
+                    qty=qty,
+                    take_profit_levels=tp_levels,
+                    ratios=ratios,
+                    step_size=step_info['step_size'],
+                    min_qty=step_info['min_qty'],
+                    min_notional=float(step_info.get('min_notional', 5.0) or 5.0),
+                )
+        else:
+            step_info = self._get_symbol_step_size(symbol)
+            min_notional = float(step_info.get('min_notional', 5.0) or 5.0)
+            valid_pairs = [
+                (level, tp_qty)
+                for level, tp_qty in zip(tp_levels, tp_qtys)
+                if float(tp_qty) >= step_info['min_qty'] and float(tp_qty) * float(level) >= min_notional
+            ]
+            if not valid_pairs and tp_levels:
+                valid_pairs = [(tp_levels[0], qty)]
+            tp_levels = [p for p, _ in valid_pairs]
+            tp_qtys = [q for _, q in valid_pairs]
+
+        for tp_price, tp_qty in zip(tp_levels, tp_qtys):
+            already_exists = any(
+                existing > 0 and abs(existing - tp_price) / tp_price < 0.0001
+                for existing in existing_tp_prices
+            )
+            if already_exists:
+                continue
+            try:
+                tp_order = self._send_algo_request(
+                    'POST',
+                    '/fapi/v1/algoOrder',
+                    params={
+                        'symbol': symbol,
+                        'side': close_side,
+                        'type': 'TAKE_PROFIT_MARKET',
+                        'algoType': 'CONDITIONAL',
+                        'triggerPrice': f"{float(tp_price):.6f}",
+                        'quantity': str(tp_qty),
+                        'positionSide': pos_side,
+                        'workingType': 'CONTRACT_PRICE',
+                    },
+                    signed=True,
+                )
+                algo_id = str(tp_order.get('algoId', ''))
+                order.tp_algo_ids.append(algo_id)
+                order.order_ids.append(algo_id)
+                result["created_tp"] += 1
+                result["has_tp"] = True
+                logger.info("[OrderExecutor] 已补挂止盈保护单: {} | {} | {}", symbol, tp_price, algo_id)
+            except Exception as e:
+                logger.warning("[OrderExecutor] 补挂止盈失败: {} | {} | {}", symbol, tp_price, e)
+
+        order.has_exchange_stop = bool(result["has_stop"])
+        order.has_exchange_tp = bool(result["has_tp"])
+        if tp_levels and tp_qtys:
+            order.take_profit_levels = tp_levels
+            order.take_profit_quantities = tp_qtys
+        return result
+
     def cancel_algo_orders(self, symbol: str) -> int:
         """取消指定代币的所有 Algo 订单（止损/止盈挂单）
 
@@ -930,7 +1238,7 @@ class OrderExecutorModule:
                     'type': 'MARKET',
                     'quantity': str(qty_aligned),
                     'positionSide': pos_side,  # Fix #1: 使用校验后的值
-                    'newClientOrderId': f"WC_CLOSE_{order_id}",
+                    'newClientOrderId': self._make_client_order_id("WC_CLOSE_", order_id),
                 }
 
             result = self._send_request(
@@ -1105,7 +1413,7 @@ class OrderExecutorModule:
         
         self.order_counter += 1
         order_id = f"WC_SPOT_{int(time.time())}_{self.order_counter}"
-        client_order_id = order_id  # 用于幂等性
+        client_order_id = self._make_client_order_id("WC_SPOT_", order_id)  # 用于幂等性
         
         logger.info(f"[OrderExecutor] 现货开仓: {symbol} LONG")
         logger.info(f"  入场价: ${entry_price:.6f}")

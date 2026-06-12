@@ -95,6 +95,7 @@ class InfoAggregatorModule:
         ])
         self.sentiment_threshold = config.get('sentiment_threshold', 0.1)
         self.max_items = config.get('max_items_per_source', 5)
+        self.request_timeout = min(float(config.get('request_timeout', 8)), 10.0)
         self.session: Optional[aiohttp.ClientSession] = None
         
         logger.info("[InfoAggregator] 信息聚合模块初始化 | 来源: {}", 
@@ -104,7 +105,7 @@ class InfoAggregatorModule:
         """获取或创建HTTP会话"""
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=self.request_timeout)
             )
         return self.session
     

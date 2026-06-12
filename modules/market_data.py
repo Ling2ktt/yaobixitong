@@ -227,7 +227,7 @@ class MarketDataModule:
                 logger.debug("[MarketData] {} 完整错误: {}", exchange_name, e, exc_info=True)
         
         if not all_klines:
-            logger.error("[MarketData] 所有交易所K线获取失败: {}", symbol)
+            logger.warning("[MarketData] 所有交易所K线获取失败: {}", symbol)
             return pd.DataFrame()
         
         # 合并双源数据 - 按时间戳对齐

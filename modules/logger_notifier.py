@@ -191,6 +191,61 @@ class LoggerNotifierModule:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                exchange TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT,
+                amount REAL,
+                entry_price REAL,
+                mark_price REAL,
+                unrealized_pnl REAL,
+                realized_pnl REAL,
+                leverage REAL,
+                status TEXT DEFAULT 'open',
+                raw_data TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT,
+                order_id TEXT,
+                decision_id TEXT,
+                symbol TEXT,
+                direction TEXT,
+                status TEXT,
+                strategy TEXT,
+                entry_time TEXT,
+                entry_price REAL,
+                stop_loss REAL,
+                take_profit_levels TEXT,
+                initial_risk_usdt REAL,
+                initial_risk_pct REAL,
+                fees REAL,
+                funding_fee REAL,
+                gross_pnl REAL,
+                net_pnl REAL,
+                r_multiple REAL,
+                signal_reason TEXT,
+                setup_reason TEXT,
+                risk_passed INTEGER,
+                risk_level TEXT,
+                risk_checks TEXT,
+                trend_4h TEXT,
+                raw_trade TEXT,
+                raw_decision TEXT,
+                raw_risk TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
         # 市场数据表（精简）
         cursor.execute('''
@@ -262,7 +317,72 @@ class LoggerNotifierModule:
             logger.debug("[LoggerNotifier] 交易记录已保存")
         except Exception as e:
             logger.error("[LoggerNotifier] 保存交易记录失败: {}", e)
-    
+
+    def save_trade_journal(self, journal: Dict[str, Any]):
+        """保存交易复盘记录"""
+        if not self.db_path:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            def _jsonify(value):
+                if value is None:
+                    return ""
+                if isinstance(value, str):
+                    return value
+                return json.dumps(value, ensure_ascii=False)
+
+            take_profit_levels = journal.get('take_profit_levels', [])
+            if take_profit_levels and not isinstance(take_profit_levels, str):
+                take_profit_levels = json.dumps(take_profit_levels, ensure_ascii=False)
+
+            cursor.execute('''
+                INSERT INTO trade_journal (
+                    trade_id, order_id, decision_id, symbol, direction, status, strategy,
+                    entry_time, entry_price, stop_loss, take_profit_levels,
+                    initial_risk_usdt, initial_risk_pct, fees, funding_fee,
+                    gross_pnl, net_pnl, r_multiple, signal_reason, setup_reason,
+                    risk_passed, risk_level, risk_checks, trend_4h,
+                    raw_trade, raw_decision, raw_risk
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                journal.get('trade_id', ''),
+                journal.get('order_id', ''),
+                journal.get('decision_id', ''),
+                journal.get('symbol', ''),
+                journal.get('direction', ''),
+                journal.get('status', ''),
+                journal.get('strategy', ''),
+                journal.get('entry_time', datetime.now().isoformat()),
+                journal.get('entry_price', 0),
+                journal.get('stop_loss'),
+                take_profit_levels,
+                journal.get('initial_risk_usdt', 0),
+                journal.get('initial_risk_pct', 0),
+                journal.get('fees', 0),
+                journal.get('funding_fee', 0),
+                journal.get('gross_pnl', 0),
+                journal.get('net_pnl', 0),
+                journal.get('r_multiple', 0),
+                journal.get('signal_reason', ''),
+                journal.get('setup_reason', ''),
+                1 if journal.get('risk_passed', False) else 0,
+                journal.get('risk_level', ''),
+                _jsonify(journal.get('risk_checks', [])),
+                journal.get('trend_4h', ''),
+                _jsonify(journal.get('raw_trade', {})),
+                _jsonify(journal.get('raw_decision', {})),
+                _jsonify(journal.get('raw_risk', {})),
+            ))
+
+            conn.commit()
+            conn.close()
+            logger.debug("[LoggerNotifier] 交易复盘记录已保存")
+        except Exception as e:
+            logger.error("[LoggerNotifier] 保存交易复盘记录失败: {}", e)
+
     def save_decision(self, decision: Dict[str, Any]):
         """保存决策记录"""
         if not self.db_path:
@@ -326,6 +446,7 @@ class LoggerNotifierModule:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            snapshot_ts = snapshot.get('timestamp', datetime.now().isoformat())
             
             for ex, data in snapshot.get('accounts', {}).items():
                 cursor.execute('''
@@ -334,15 +455,40 @@ class LoggerNotifierModule:
                      position_count, daily_pnl, total_pnl, raw_data)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    snapshot.get('timestamp', datetime.now().isoformat()),
+                    snapshot_ts,
                     ex,
                     data.get('total_equity_usdt', 0),
                     data.get('available_usdt', 0),
                     data.get('position_count', 0),
                     data.get('daily_pnl', 0),
                     data.get('total_pnl', 0),
-                    json.dumps(data)
+                    json.dumps(data, ensure_ascii=False, default=str)
                 ))
+
+                cursor.execute("DELETE FROM positions WHERE exchange = ?", (ex,))
+                for pos in data.get('positions', []) or []:
+                    amount = pos.get('amount', pos.get('contracts', pos.get('positionAmt', 0))) or 0
+                    side = pos.get('side') or ('long' if float(amount) > 0 else 'short')
+                    cursor.execute('''
+                        INSERT INTO positions (
+                            timestamp, exchange, symbol, side, amount, entry_price,
+                            mark_price, unrealized_pnl, realized_pnl, leverage, status, raw_data
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        pos.get('timestamp', snapshot_ts),
+                        ex,
+                        pos.get('symbol', ''),
+                        side,
+                        abs(float(amount)),
+                        pos.get('entry_price', pos.get('entryPrice', 0)) or 0,
+                        pos.get('mark_price', pos.get('markPrice', 0)) or 0,
+                        pos.get('unrealized_pnl', pos.get('unrealizedPnl', pos.get('unrealizedProfit', 0))) or 0,
+                        pos.get('realized_pnl', pos.get('realizedPnl', 0)) or 0,
+                        pos.get('leverage', 1) or 1,
+                        pos.get('status', 'open'),
+                        json.dumps(pos, ensure_ascii=False, default=str),
+                    ))
             
             conn.commit()
             conn.close()

@@ -125,7 +125,7 @@ risk:
   max_daily_loss_pct: 0.2
   max_daily_loss_usdt: 20
   max_position_value_usdt: 100
-  max_positions: 5
+  max_positions: 10
   max_single_order_pct: 0.3
   max_single_order_usdt: 10
   stop_loss_pct: 0.02
